@@ -238,7 +238,13 @@ export const createMiddlewareEnabledHandlers = (
 
   return {
     handlerContext,
-    listToolsWithMiddleware,
-    callToolWithMiddleware,
+    listToolsWithMiddleware: ((request, context) =>
+      mcpServerPool.withSessionActivity(sessionId, () =>
+        listToolsWithMiddleware(request, context),
+      )) as ListToolsHandler,
+    callToolWithMiddleware: ((request, context) =>
+      mcpServerPool.withSessionActivity(sessionId, () =>
+        callToolWithMiddleware(request, context),
+      )) as CallToolHandler,
   };
 };

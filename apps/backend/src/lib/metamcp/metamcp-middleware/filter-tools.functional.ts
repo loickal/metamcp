@@ -6,10 +6,12 @@ import logger from "@/utils/logger";
 import { db } from "../../../db/index";
 import {
   mcpServersTable,
+  namespaceServerMappingsTable,
   namespaceToolMappingsTable,
   toolsTable,
 } from "../../../db/schema";
 import { parseToolName } from "../tool-name-parser";
+import { sanitizeName } from "../utils";
 import {
   CallToolMiddleware,
   ListToolsMiddleware,
@@ -139,7 +141,7 @@ async function getToolStatus(
       `Error fetching tool status for ${toolName} in namespace ${namespaceUuid}:`,
       error,
     );
-    return null;
+    throw new Error("Tool permissions unavailable");
   }
 }
 
@@ -148,18 +150,23 @@ async function getToolStatus(
 /**
  * Get server UUID by name
  */
-async function getServerUuidByName(serverName: string): Promise<string | null> {
-  try {
-    const [server] = await db
-      .select({ uuid: mcpServersTable.uuid })
-      .from(mcpServersTable)
-      .where(eq(mcpServersTable.name, serverName));
-
-    return server?.uuid || null;
-  } catch (error) {
-    logger.error(`Error fetching server UUID for ${serverName}:`, error);
-    return null;
-  }
+async function getServerUuidByName(
+  serverName: string,
+  namespaceUuid: string,
+): Promise<string | null> {
+  const servers = await db
+    .select({ uuid: mcpServersTable.uuid, name: mcpServersTable.name })
+    .from(mcpServersTable)
+    .innerJoin(
+      namespaceServerMappingsTable,
+      eq(mcpServersTable.uuid, namespaceServerMappingsTable.mcp_server_uuid),
+    )
+    .where(eq(namespaceServerMappingsTable.namespace_uuid, namespaceUuid));
+  const matches = servers.filter(
+    (server) => sanitizeName(server.name) === serverName,
+  );
+  if (matches.length > 1) throw new Error("Ambiguous namespace tool prefix");
+  return matches[0]?.uuid ?? null;
 }
 
 /**
@@ -174,46 +181,28 @@ async function filterActiveTools(
     return tools;
   }
 
-  const activeTools: Tool[] = [];
-
-  await Promise.allSettled(
+  const filtered = await Promise.all(
     tools.map(async (tool) => {
-      try {
-        const parsed = parseToolName(tool.name);
-        if (!parsed) {
-          // If tool name doesn't follow expected format, include it
-          activeTools.push(tool);
-          return;
-        }
-
-        const serverUuid = await getServerUuidByName(parsed.serverName);
-        if (!serverUuid) {
-          // If server not found, include the tool (fallback behavior)
-          activeTools.push(tool);
-          return;
-        }
-
-        const status = await getToolStatus(
-          namespaceUuid,
-          parsed.originalToolName,
-          serverUuid,
-          useCache,
+      const parsed = parseToolName(tool.name);
+      if (!parsed) throw new Error("Invalid namespace tool name");
+      const serverUuid = await getServerUuidByName(
+        parsed.serverName,
+        namespaceUuid,
+      );
+      if (!serverUuid)
+        throw new Error(
+          "Namespace tool configuration changed; retry discovery",
         );
-
-        // If no mapping exists or tool is active, include it
-        if (status === null || status === "ACTIVE") {
-          activeTools.push(tool);
-        }
-        // If status is "INACTIVE", tool is filtered out
-      } catch (error) {
-        logger.error(`Error checking tool status for ${tool.name}:`, error);
-        // On error, include the tool (fail-safe behavior)
-        activeTools.push(tool);
-      }
+      const status = await getToolStatus(
+        namespaceUuid,
+        parsed.originalToolName,
+        serverUuid,
+        useCache,
+      );
+      return status === "INACTIVE" ? undefined : tool;
     }),
   );
-
-  return activeTools;
+  return filtered.filter((tool): tool is Tool => !!tool);
 }
 
 /**
@@ -254,8 +243,7 @@ async function isToolAllowed(
       `Error checking if tool ${toolName} is allowed in namespace ${namespaceUuid}:`,
       error,
     );
-    // On error, allow the tool (fail-safe behavior)
-    return { allowed: true };
+    return { allowed: false, reason: "Tool permissions unavailable" };
   }
 }
 
@@ -312,7 +300,10 @@ export function createFilterCallToolMiddleware(
       // For now, let's extract it from the tool name format
       const parsed = parseToolName(toolName);
       if (parsed) {
-        const serverUuid = await getServerUuidByName(parsed.serverName);
+        const serverUuid = await getServerUuidByName(
+          parsed.serverName,
+          context.namespaceUuid,
+        );
         if (serverUuid) {
           const { allowed, reason } = await isToolAllowed(
             toolName,

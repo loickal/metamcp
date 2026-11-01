@@ -28,3 +28,47 @@ it("binds resumed sessions and deletes to user and endpoint, including public re
   access.check(req("alice", "endpoint-a", "session"), {} as Response, next);
   expect(next).toHaveBeenCalledOnce();
 });
+
+it("preserves OAuth and API-key ownership and rejects changed namespace routing", () => {
+  for (const auth of [
+    { oauthUserId: "alice" },
+    { apiKeyUserId: "alice", apiKeyUuid: "key-a" },
+  ]) {
+    const access = createSessionAccess();
+    const request = Object.assign(req(undefined, "unused", "session"), {
+      ...auth,
+      endpointName: "loic",
+      namespaceUuid: "ns-a",
+    });
+    access.bind("session", request);
+    const next = vi.fn();
+    access.check(request, {} as Response, next);
+    expect(next).toHaveBeenCalledOnce();
+    for (const changed of [
+      { namespaceUuid: "ns-b" },
+      { endpointName: "other" },
+      "oauthUserId" in auth ? { oauthUserId: "bob" } : { apiKeyUuid: "key-b" },
+    ]) {
+      const response = { status: vi.fn().mockReturnThis(), end: vi.fn() };
+      const denied = vi.fn();
+      access.check(
+        Object.assign({}, request, changed),
+        response as unknown as Response,
+        denied,
+      );
+      expect(response.status).toHaveBeenCalledWith(404);
+      expect(denied).not.toHaveBeenCalled();
+    }
+  }
+});
+it("rejects conflicting header/query session IDs before SSE message routing", () => {
+  const access = createSessionAccess();
+  access.bind("alice-session", req("alice", "endpoint-a"));
+  const request = req("alice", "endpoint-a", "alice-session");
+  request.query.sessionId = "bob-session";
+  const response = { status: vi.fn().mockReturnThis(), end: vi.fn() };
+  const next = vi.fn();
+  access.check(request, response as unknown as Response, next);
+  expect(response.status).toHaveBeenCalledWith(404);
+  expect(next).not.toHaveBeenCalled();
+});

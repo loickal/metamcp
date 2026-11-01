@@ -1,6 +1,10 @@
+import type { Server as HttpServer } from "node:http";
+
 import express from "express";
 
 import { auth } from "./auth";
+import { mcpEvent } from "./lib/mcp-diagnostics";
+import { shutdownMcpSessions } from "./lib/session-lifetime-manager";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
 import mcpProxyRouter from "./routers/mcp-proxy";
 import oauthRouter from "./routers/oauth";
@@ -83,11 +87,14 @@ app.use("/mcp-proxy", mcpProxyRouter);
 // Mount tRPC routes
 app.use("/trpc", trpcRouter);
 
+let httpServer: HttpServer | undefined;
+let shuttingDown = false;
 async function start(): Promise<void> {
   // Startup initialization (must run after DB is reachable/migrations are applied, and before listening)
   await initializeOnStartup();
 
-  app.listen(12009, async () => {
+  httpServer = app.listen(12009, async () => {
+    mcpEvent("backend_started");
     console.log(`Server is running on port 12009`);
     console.log(`Auth routes available at: http://localhost:12009/api/auth`);
     console.log(
@@ -117,15 +124,22 @@ start().catch((err) => {
 // Graceful shutdown: clean up MCP server pools on SIGTERM/SIGINT
 // Prevents orphaned STDIO child processes when backend restarts
 const gracefulShutdown = async (signal: string) => {
-  console.log(`${signal} received, cleaning up MCP server pools...`);
+  if (shuttingDown) return;
+  shuttingDown = true;
+  httpServer?.close();
+  mcpEvent("backend_shutdown", { signal });
+  const deadline = setTimeout(() => {
+    // eslint-disable-next-line no-process-exit -- bounded process shutdown
+    process.exit(1);
+  }, 10_000);
+  deadline.unref();
   try {
     const { mcpServerPool } = await import("./lib/metamcp");
     const { metaMcpServerPool } =
       await import("./lib/metamcp/metamcp-server-pool");
-    await Promise.allSettled([
-      mcpServerPool.cleanupAll(),
-      metaMcpServerPool.cleanupAll(),
-    ]);
+    await shutdownMcpSessions();
+    await metaMcpServerPool.cleanupAll();
+    await mcpServerPool.cleanupAll(true);
     console.log("MCP server pools cleaned up successfully");
   } catch (error) {
     console.error("Error during graceful shutdown:", error);

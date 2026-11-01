@@ -23,23 +23,22 @@ import {
   Progress,
   PromptListChangedNotificationSchema,
   PromptReference,
-  Request,
   ResourceListChangedNotificationSchema,
   ResourceReference,
   ResourceUpdatedNotificationSchema,
-  Result,
   ServerCapabilities,
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { McpServerType, McpServerTypeEnum } from "@repo/zod-types";
 import { useMemoizedFn } from "ahooks";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import type * as z3 from "zod/v3";
 import type * as z4 from "zod/v4/core";
 
 import { ConnectionStatus } from "../lib/constants";
 import { getAppUrl } from "../lib/env";
+import { requestWithMcpSessionRecovery } from "../lib/mcp-session-recovery";
 import {
   Notification,
   StdErrNotificationSchema,
@@ -104,9 +103,11 @@ export function useConnection({
   const [serverCapabilities, setServerCapabilities] =
     useState<ServerCapabilities | null>(null);
   const [mcpClient, setMcpClient] = useState<Client | null>(null);
-  const [clientTransport, setClientTransport] = useState<Transport | null>(
-    null,
-  );
+  const current = useRef<{ client: Client; transport: Transport } | null>(null);
+  const connecting = useRef<Promise<void> | null>(null);
+  const recovering = useRef<Promise<void> | null>(null);
+  const generation = useRef(0);
+  const reconnect = useRef<() => Promise<void>>(async () => {});
   const [requestHistory, setRequestHistory] = useState<
     { request: string; response?: string }[]
   >([]);
@@ -142,7 +143,7 @@ export function useConnection({
       schema: T,
       options?: RequestOptions & { suppressToast?: boolean },
     ): Promise<SchemaOutput<T>> => {
-      if (!mcpClient) {
+      if (!current.current) {
         throw new Error("MCP client not connected");
       }
       try {
@@ -176,10 +177,26 @@ export function useConnection({
 
         let response;
         try {
-          response = await mcpClient.request(
-            request,
-            schema,
-            mcpRequestOptions,
+          const attemptedClient = current.current.client;
+          response = await requestWithMcpSessionRecovery(
+            request.method,
+            () => {
+              const client = current.current?.client;
+              if (!client) throw new Error("MCP client not connected");
+              return client.request(request, schema, mcpRequestOptions);
+            },
+            async () => {
+              if (
+                current.current?.client !== attemptedClient &&
+                current.current
+              )
+                return;
+              if (!recovering.current)
+                recovering.current = reconnect.current().finally(() => {
+                  recovering.current = null;
+                });
+              await recovering.current;
+            },
           );
 
           pushHistory(request, response);
@@ -314,379 +331,365 @@ export function useConnection({
     return false;
   });
 
-  const connect = useMemoizedFn(
-    async (_e?: unknown, retryCount: number = 0): Promise<void> => {
-      // Skip connection if hook is disabled
-      if (!enabled) {
-        console.warn("Cannot connect: useConnection hook is disabled");
-        setConnectionStatus("disconnected");
+  const connectOnce = useMemoizedFn(async (): Promise<void> => {
+    const attemptGeneration = generation.current;
+    let attemptedTransport: Transport | undefined;
+    // Skip connection if hook is disabled
+    if (!enabled) {
+      console.warn("Cannot connect: useConnection hook is disabled");
+      setConnectionStatus("disconnected");
+      return;
+    }
+
+    // For MetaMCP connections, we don't need server data
+    if (!isMetaMCP) {
+      // Ensure transportType is defined
+      if (!transportType) {
+        console.error(
+          "Cannot connect: Transport type not defined or not fetched",
+        );
+        setConnectionStatus("error");
         return;
       }
+    }
 
-      // For MetaMCP connections, we don't need server data
-      if (!isMetaMCP) {
-        // Ensure transportType is defined
-        if (!transportType) {
-          console.error(
-            "Cannot connect: Transport type not defined or not fetched",
+    const client = new Client(
+      {
+        name: "metamcp-proxy",
+        version: "2.0.0",
+      },
+      {
+        capabilities: {
+          sampling: {},
+          roots: {
+            listChanged: true,
+          },
+        },
+      },
+    );
+
+    try {
+      await checkProxyHealth();
+    } catch {
+      setConnectionStatus("error-connecting-to-proxy");
+      return;
+    }
+
+    try {
+      // Inject auth manually instead of using SSEClientTransport, because we're
+      // proxying through the inspector server first.
+      const headers: HeadersInit = {};
+
+      // Use manually provided bearer token if available, otherwise use OAuth tokens
+      const token = bearerToken;
+      if (token) {
+        const authHeaderName = headerName || "Authorization";
+
+        // Add custom header name as a special request header to let the server know which header to pass through
+        if (authHeaderName.toLowerCase() !== "authorization") {
+          headers[authHeaderName] = token;
+          headers["x-custom-auth-header"] = authHeaderName;
+        } else {
+          headers[authHeaderName] = `Bearer ${token}`;
+        }
+      }
+
+      // Create appropriate transport
+      let transportOptions:
+        | StreamableHTTPClientTransportOptions
+        | SSEClientTransportOptions;
+
+      let mcpProxyServerUrl: URL;
+
+      // Handle MetaMCP connections
+      if (isMetaMCP) {
+        // Respect the selected transport for namespace Inspector sessions.
+        mcpProxyServerUrl = new URL(url, getAppUrl());
+        // Add includeInactiveServers as a query parameter
+        if (includeInactiveServers) {
+          mcpProxyServerUrl.searchParams.append(
+            "includeInactiveServers",
+            "true",
+          );
+        }
+        transportOptions = {
+          eventSourceInit: {
+            fetch: (
+              url: string | URL | globalThis.Request,
+              init?: RequestInit,
+            ) =>
+              fetch(url, {
+                ...init,
+                headers,
+                credentials: "include",
+              }),
+          },
+          requestInit: {
+            headers,
+            credentials: "include",
+          },
+        };
+      } else {
+        switch (transportType) {
+          case McpServerTypeEnum.enum.STDIO:
+            mcpProxyServerUrl = new URL(`/mcp-proxy/server/stdio`, getAppUrl());
+            mcpProxyServerUrl.searchParams.append("command", command);
+            mcpProxyServerUrl.searchParams.append("args", args);
+            mcpProxyServerUrl.searchParams.append("env", JSON.stringify(env));
+            transportOptions = {
+              eventSourceInit: {
+                fetch: (
+                  url: string | URL | globalThis.Request,
+                  init?: RequestInit,
+                ) =>
+                  fetch(url, {
+                    ...init,
+                    headers,
+                    credentials: "include",
+                  }),
+              },
+              requestInit: {
+                headers,
+                credentials: "include",
+              },
+              // Use maxTotalTimeout from database for reconnection delay, with fallback to 30s
+              reconnectionOptions: {
+                maxReconnectionDelay: mcpMaxTotalTimeout ?? 30000,
+                initialReconnectionDelay: 1000,
+                reconnectionDelayGrowFactor: 1.5,
+                maxRetries: 2,
+              },
+            };
+            break;
+
+          case McpServerTypeEnum.enum.SSE:
+            mcpProxyServerUrl = new URL(`/mcp-proxy/server/sse`, getAppUrl());
+            mcpProxyServerUrl.searchParams.append(
+              "mcpServerUuid",
+              mcpServerUuid,
+            );
+            transportOptions = {
+              eventSourceInit: {
+                fetch: (
+                  url: string | URL | globalThis.Request,
+                  init?: RequestInit,
+                ) =>
+                  fetch(url, {
+                    ...init,
+                    headers,
+                    credentials: "include",
+                  }),
+              },
+              requestInit: {
+                headers,
+                credentials: "include",
+              },
+              // Use maxTotalTimeout from database for reconnection delay, with fallback to 30s
+              reconnectionOptions: {
+                maxReconnectionDelay: mcpMaxTotalTimeout ?? 30000,
+                initialReconnectionDelay: 1000,
+                reconnectionDelayGrowFactor: 1.5,
+                maxRetries: 2,
+              },
+            };
+            break;
+
+          case McpServerTypeEnum.enum.STREAMABLE_HTTP:
+            mcpProxyServerUrl = new URL(`/mcp-proxy/server/mcp`, getAppUrl());
+            mcpProxyServerUrl.searchParams.append(
+              "mcpServerUuid",
+              mcpServerUuid,
+            );
+            transportOptions = {
+              eventSourceInit: {
+                fetch: (
+                  url: string | URL | globalThis.Request,
+                  init?: RequestInit,
+                ) =>
+                  fetch(url, {
+                    ...init,
+                    headers,
+                    credentials: "include",
+                  }),
+              },
+              requestInit: {
+                headers,
+                credentials: "include",
+              },
+              // Use maxTotalTimeout from database for reconnection delay, with fallback to 30s
+              reconnectionOptions: {
+                maxReconnectionDelay: mcpMaxTotalTimeout ?? 30000,
+                initialReconnectionDelay: 1000,
+                reconnectionDelayGrowFactor: 1.5,
+                maxRetries: 2,
+              },
+            };
+            break;
+
+          default:
+            console.error(`Unsupported transport type: ${transportType}`);
+            setConnectionStatus("error");
+            return;
+        }
+
+        mcpProxyServerUrl.searchParams.append("transportType", transportType);
+      }
+
+      if (onNotification) {
+        [
+          CancelledNotificationSchema,
+          LoggingMessageNotificationSchema,
+          ResourceUpdatedNotificationSchema,
+          ResourceListChangedNotificationSchema,
+          ToolListChangedNotificationSchema,
+          PromptListChangedNotificationSchema,
+        ].forEach((notificationSchema) => {
+          client.setNotificationHandler(notificationSchema, onNotification);
+        });
+
+        client.fallbackNotificationHandler = (
+          notification: Notification,
+        ): Promise<void> => {
+          onNotification(notification);
+          return Promise.resolve();
+        };
+      }
+
+      if (onStdErrNotification) {
+        client.setNotificationHandler(
+          StdErrNotificationSchema,
+          onStdErrNotification,
+        );
+      }
+
+      let capabilities;
+      try {
+        const transport =
+          transportType === McpServerTypeEnum.enum.STREAMABLE_HTTP
+            ? new StreamableHTTPClientTransport(mcpProxyServerUrl, {
+                ...transportOptions,
+                sessionId: undefined,
+              })
+            : new SSEClientTransport(mcpProxyServerUrl, transportOptions);
+        attemptedTransport = transport;
+        await client.connect(transport);
+        if (attemptGeneration !== generation.current) return;
+
+        capabilities = client.getServerCapabilities();
+        const initializeRequest = {
+          method: "initialize",
+        };
+        pushHistory(initializeRequest, {
+          capabilities,
+          serverInfo: client.getServerVersion(),
+          instructions: client.getInstructions(),
+        });
+      } catch (error) {
+        console.error(
+          `Failed to connect to MCP Server via the MCP Inspector Proxy: ${mcpProxyServerUrl}:`,
+          error,
+        );
+
+        // Check if it's a proxy auth error
+        if (isProxyAuthError(error)) {
+          toast.error(
+            "Please enter the session token from the proxy server console in the Configuration settings.",
           );
           setConnectionStatus("error");
           return;
         }
+
+        await handleAuthError(error);
+        if (is401Error(error)) {
+          // Don't set error state if we're about to redirect for auth
+
+          return;
+        }
+        throw error;
+      }
+      setServerCapabilities(capabilities ?? null);
+      setCompletionsSupported(true); // Reset completions support on new connection
+
+      if (onPendingRequest) {
+        client.setRequestHandler(CreateMessageRequestSchema, (request) => {
+          return new Promise((resolve, reject) => {
+            onPendingRequest(request, resolve, reject);
+          });
+        });
       }
 
-      const client = new Client(
-        {
-          name: "metamcp-proxy",
-          version: "2.0.0",
-        },
-        {
-          capabilities: {
-            sampling: {},
-            roots: {
-              listChanged: true,
-            },
-          },
-        },
-      );
+      if (getRoots) {
+        client.setRequestHandler(ListRootsRequestSchema, async () => {
+          return { roots: getRoots() };
+        });
+      }
 
-      try {
-        await checkProxyHealth();
-      } catch {
-        setConnectionStatus("error-connecting-to-proxy");
+      if (attemptGeneration !== generation.current || !attemptedTransport)
         return;
-      }
-
-      try {
-        // Inject auth manually instead of using SSEClientTransport, because we're
-        // proxying through the inspector server first.
-        const headers: HeadersInit = {};
-
-        // Use manually provided bearer token if available, otherwise use OAuth tokens
-        const token = bearerToken;
-        if (token) {
-          const authHeaderName = headerName || "Authorization";
-
-          // Add custom header name as a special request header to let the server know which header to pass through
-          if (authHeaderName.toLowerCase() !== "authorization") {
-            headers[authHeaderName] = token;
-            headers["x-custom-auth-header"] = authHeaderName;
-          } else {
-            headers[authHeaderName] = `Bearer ${token}`;
-          }
-        }
-
-        // Create appropriate transport
-        let transportOptions:
-          | StreamableHTTPClientTransportOptions
-          | SSEClientTransportOptions;
-
-        let mcpProxyServerUrl: URL;
-
-        // Handle MetaMCP connections
-        if (isMetaMCP) {
-          // For MetaMCP, we use SSE connection to the metamcp proxy endpoint
-          mcpProxyServerUrl = new URL(url, getAppUrl());
-          // Add includeInactiveServers as a query parameter
-          if (includeInactiveServers) {
-            mcpProxyServerUrl.searchParams.append(
-              "includeInactiveServers",
-              "true",
-            );
-          }
-          transportOptions = {
-            eventSourceInit: {
-              fetch: (
-                url: string | URL | globalThis.Request,
-                init?: RequestInit,
-              ) =>
-                fetch(url, {
-                  ...init,
-                  headers,
-                  credentials: "include",
-                }),
-            },
-            requestInit: {
-              headers,
-              credentials: "include",
-            },
-          };
-        } else {
-          switch (transportType) {
-            case McpServerTypeEnum.enum.STDIO:
-              mcpProxyServerUrl = new URL(
-                `/mcp-proxy/server/stdio`,
-                getAppUrl(),
-              );
-              mcpProxyServerUrl.searchParams.append("command", command);
-              mcpProxyServerUrl.searchParams.append("args", args);
-              mcpProxyServerUrl.searchParams.append("env", JSON.stringify(env));
-              transportOptions = {
-                eventSourceInit: {
-                  fetch: (
-                    url: string | URL | globalThis.Request,
-                    init?: RequestInit,
-                  ) =>
-                    fetch(url, {
-                      ...init,
-                      headers,
-                      credentials: "include",
-                    }),
-                },
-                requestInit: {
-                  headers,
-                  credentials: "include",
-                },
-                // Use maxTotalTimeout from database for reconnection delay, with fallback to 30s
-                reconnectionOptions: {
-                  maxReconnectionDelay: mcpMaxTotalTimeout ?? 30000,
-                  initialReconnectionDelay: 1000,
-                  reconnectionDelayGrowFactor: 1.5,
-                  maxRetries: 2,
-                },
-              };
-              break;
-
-            case McpServerTypeEnum.enum.SSE:
-              mcpProxyServerUrl = new URL(`/mcp-proxy/server/sse`, getAppUrl());
-              mcpProxyServerUrl.searchParams.append(
-                "mcpServerUuid",
-                mcpServerUuid,
-              );
-              transportOptions = {
-                eventSourceInit: {
-                  fetch: (
-                    url: string | URL | globalThis.Request,
-                    init?: RequestInit,
-                  ) =>
-                    fetch(url, {
-                      ...init,
-                      headers,
-                      credentials: "include",
-                    }),
-                },
-                requestInit: {
-                  headers,
-                  credentials: "include",
-                },
-                // Use maxTotalTimeout from database for reconnection delay, with fallback to 30s
-                reconnectionOptions: {
-                  maxReconnectionDelay: mcpMaxTotalTimeout ?? 30000,
-                  initialReconnectionDelay: 1000,
-                  reconnectionDelayGrowFactor: 1.5,
-                  maxRetries: 2,
-                },
-              };
-              break;
-
-            case McpServerTypeEnum.enum.STREAMABLE_HTTP:
-              mcpProxyServerUrl = new URL(`/mcp-proxy/server/mcp`, getAppUrl());
-              mcpProxyServerUrl.searchParams.append(
-                "mcpServerUuid",
-                mcpServerUuid,
-              );
-              transportOptions = {
-                eventSourceInit: {
-                  fetch: (
-                    url: string | URL | globalThis.Request,
-                    init?: RequestInit,
-                  ) =>
-                    fetch(url, {
-                      ...init,
-                      headers,
-                      credentials: "include",
-                    }),
-                },
-                requestInit: {
-                  headers,
-                  credentials: "include",
-                },
-                // Use maxTotalTimeout from database for reconnection delay, with fallback to 30s
-                reconnectionOptions: {
-                  maxReconnectionDelay: mcpMaxTotalTimeout ?? 30000,
-                  initialReconnectionDelay: 1000,
-                  reconnectionDelayGrowFactor: 1.5,
-                  maxRetries: 2,
-                },
-              };
-              break;
-
-            default:
-              console.error(`Unsupported transport type: ${transportType}`);
-              setConnectionStatus("error");
-              return;
-          }
-
-          mcpProxyServerUrl.searchParams.append("transportType", transportType);
-        }
-
-        if (onNotification) {
-          [
-            CancelledNotificationSchema,
-            LoggingMessageNotificationSchema,
-            ResourceUpdatedNotificationSchema,
-            ResourceListChangedNotificationSchema,
-            ToolListChangedNotificationSchema,
-            PromptListChangedNotificationSchema,
-          ].forEach((notificationSchema) => {
-            client.setNotificationHandler(notificationSchema, onNotification);
-          });
-
-          client.fallbackNotificationHandler = (
-            notification: Notification,
-          ): Promise<void> => {
-            onNotification(notification);
-            return Promise.resolve();
-          };
-        }
-
-        if (onStdErrNotification) {
-          client.setNotificationHandler(
-            StdErrNotificationSchema,
-            onStdErrNotification,
-          );
-        }
-
-        let capabilities;
-        try {
-          const transport = isMetaMCP
-            ? new SSEClientTransport(mcpProxyServerUrl, transportOptions)
-            : transportType === McpServerTypeEnum.enum.STREAMABLE_HTTP
-              ? new StreamableHTTPClientTransport(mcpProxyServerUrl, {
-                  sessionId: undefined,
-                  ...transportOptions,
-                })
-              : new SSEClientTransport(mcpProxyServerUrl, transportOptions);
-
-          await client.connect(transport as Transport);
-
-          setClientTransport(transport);
-
-          capabilities = client.getServerCapabilities();
-          const initializeRequest = {
-            method: "initialize",
-          };
-          pushHistory(initializeRequest, {
-            capabilities,
-            serverInfo: client.getServerVersion(),
-            instructions: client.getInstructions(),
-          });
-        } catch (error) {
-          console.error(
-            `Failed to connect to MCP Server via the MCP Inspector Proxy: ${mcpProxyServerUrl}:`,
-            error,
-          );
-
-          // Check if it's a proxy auth error
-          if (isProxyAuthError(error)) {
-            toast.error(
-              "Please enter the session token from the proxy server console in the Configuration settings.",
-            );
-            setConnectionStatus("error");
-            return;
-          }
-
-          const shouldRetry = await handleAuthError(error);
-          if (shouldRetry) {
-            return connect(undefined, retryCount + 1);
-          }
-          if (is401Error(error)) {
-            // Don't set error state if we're about to redirect for auth
-
-            return;
-          }
-          throw error;
-        }
-        setServerCapabilities(capabilities ?? null);
-        setCompletionsSupported(true); // Reset completions support on new connection
-
-        if (onPendingRequest) {
-          client.setRequestHandler(CreateMessageRequestSchema, (request) => {
-            return new Promise((resolve, reject) => {
-              onPendingRequest(request, resolve, reject);
-            });
-          });
-        }
-
-        if (getRoots) {
-          client.setRequestHandler(ListRootsRequestSchema, async () => {
-            return { roots: getRoots() };
-          });
-        }
-
-        setMcpClient(client);
-        setConnectionStatus("connected");
-      } catch (e) {
-        console.error(e);
+      current.current = { client, transport: attemptedTransport };
+      setMcpClient(client);
+      setConnectionStatus("connected");
+    } catch (e) {
+      console.error(e);
+      if (attemptGeneration === generation.current)
         setConnectionStatus("error");
-      }
-    },
-  );
-
-  const disconnect = useMemoizedFn(async () => {
-    try {
-      if (
-        transportType === McpServerTypeEnum.enum.STREAMABLE_HTTP &&
-        clientTransport
-      ) {
-        await (
-          clientTransport as StreamableHTTPClientTransport
-        ).terminateSession();
-      }
-      if (mcpClient) {
-        await mcpClient.close();
-      }
-      if (enabled) {
-        // Only clear auth provider if hook is enabled (to avoid clearing when just disabled)
-      }
-    } catch (error) {
-      console.error("Error during disconnect:", error);
     } finally {
-      setMcpClient(null);
-      setClientTransport(null);
-      setConnectionStatus("disconnected");
-      setCompletionsSupported(false);
-      setServerCapabilities(null);
+      if (current.current?.client !== client) {
+        if (attemptedTransport instanceof StreamableHTTPClientTransport)
+          await attemptedTransport.terminateSession().catch(() => {});
+        await client.close().catch(() => {});
+      }
     }
   });
 
-  // Handle enabled/disabled state changes
-  useEffect(() => {
-    if (!enabled && connectionStatus === "connected") {
-      // Disconnect when hook becomes disabled
-      disconnect();
+  const connect = useMemoizedFn(async () => {
+    if (current.current) return;
+    if (connecting.current) return connecting.current;
+    connecting.current = connectOnce().finally(() => {
+      connecting.current = null;
+    });
+    return connecting.current;
+  });
+
+  const disconnect = useMemoizedFn(async () => {
+    generation.current++;
+    const previous = current.current;
+    current.current = null;
+    setMcpClient(null);
+    setConnectionStatus("disconnected");
+    setCompletionsSupported(false);
+    setServerCapabilities(null);
+    try {
+      if (previous?.transport instanceof StreamableHTTPClientTransport)
+        await previous.transport.terminateSession();
+    } catch {
+      /* A session already lost after restart needs no DELETE. */
+    } finally {
+      await previous?.client.close().catch(() => {});
     }
-  }, [enabled, connectionStatus, disconnect]);
-
-  // Cleanup handlers for component unmount and browser navigation
+    await connecting.current;
+  });
+  reconnect.current = async () => {
+    await disconnect();
+    await connect();
+    if (!current.current) throw new Error("MCP reconnection failed");
+  };
   useEffect(() => {
-    const handleBeforeUnload = () => {
-      // Attempt to close connection gracefully before page unload
-      if (connectionStatus === "connected") {
-        disconnect();
-      }
+    if (!enabled) void disconnect();
+  }, [enabled, disconnect]);
+  // Do not depend on connectionStatus: effect cleanup on status changes used
+  // to disconnect live/new connections. Unload is best effort; idle expiry is
+  // the fallback when the browser cannot finish DELETE.
+  useEffect(() => {
+    const leave = () => {
+      void disconnect();
     };
-
-    const handleUnload = () => {
-      // Final cleanup on actual page unload (refresh, close, navigate away)
-      if (connectionStatus === "connected") {
-        disconnect();
-      }
-    };
-
-    // Add event listeners for browser navigation
-    window.addEventListener("beforeunload", handleBeforeUnload);
-    window.addEventListener("unload", handleUnload);
-
-    // Cleanup on component unmount
+    window.addEventListener("pagehide", leave);
     return () => {
-      window.removeEventListener("beforeunload", handleBeforeUnload);
-      window.removeEventListener("unload", handleUnload);
-      if (connectionStatus === "connected") {
-        disconnect();
-      }
+      window.removeEventListener("pagehide", leave);
+      leave();
     };
-  }, [connectionStatus, disconnect]);
+  }, [disconnect]);
 
   return {
     connectionStatus,
