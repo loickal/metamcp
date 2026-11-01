@@ -98,11 +98,12 @@ COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=nextjs:nodejs /app/package.json ./
 COPY --from=builder --chown=nextjs:nodejs /app/pnpm-workspace.yaml ./
 
-# Install production dependencies only
-RUN pnpm install --prod
 
-# Install drizzle-kit locally in backend for migrations
-RUN cd apps/backend && pnpm add drizzle-kit@0.31.1
+# Reuse successfully installed workspace dependencies.
+# Includes drizzle-kit required for database migrations.
+COPY --from=builder --chown=nextjs:nodejs /app/apps/frontend/node_modules ./apps/frontend/node_modules
+COPY --from=builder --chown=nextjs:nodejs /app/apps/backend/node_modules ./apps/backend/node_modules
+
 
 # Copy startup script
 COPY --chown=nextjs:nodejs docker-entrypoint.sh ./
