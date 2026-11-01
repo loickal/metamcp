@@ -48,9 +48,21 @@ COPY . .
 # Build all packages and apps
 RUN pnpm build
 
-RUN sed -i -e "s/30000/600000/" \
-    "node_modules/.pnpm/next@15.5.12_react-dom@19.1.2_react@19.1.2__react@19.1.2/node_modules/next/dist/server/lib/router-utils/proxy-request.js" \
-    "node_modules/.pnpm/next@15.5.12_react-dom@19.1.2_react@19.1.2__react@19.1.2/node_modules/next/dist/esm/server/lib/router-utils/proxy-request.js"
+
+# Patch Next.js proxy timeout without relying on pnpm's internal paths
+RUN set -eu; \
+    NEXT_ROOT="$(dirname "$(node -p "require.resolve('next/package.json', {paths: ['./apps/frontend']})")")"; \
+    for file in \
+      "$NEXT_ROOT/dist/server/lib/router-utils/proxy-request.js" \
+      "$NEXT_ROOT/dist/esm/server/lib/router-utils/proxy-request.js"; do \
+        if [ -f "$file" ]; then \
+          sed -i 's/30000/600000/g' "$file"; \
+          echo "Patched: $file"; \
+        else \
+          echo "Skipping missing file: $file"; \
+        fi; \
+    done
+
 
 # Production runner stage
 FROM base AS runner
