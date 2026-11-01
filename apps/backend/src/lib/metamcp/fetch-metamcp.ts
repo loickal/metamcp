@@ -1,8 +1,4 @@
-import {
-  McpServerErrorStatusEnum,
-  McpServerStatusEnum,
-  ServerParameters,
-} from "@repo/zod-types";
+import { McpServerStatusEnum, ServerParameters } from "@repo/zod-types";
 import { and, eq } from "drizzle-orm";
 
 import logger from "@/utils/logger";
@@ -36,10 +32,8 @@ export async function getMcpServers(
       );
     }
 
-    // Always exclude servers with ERROR status (these are crashed servers)
-    whereConditions.push(
-      eq(mcpServersTable.error_status, McpServerErrorStatusEnum.enum.NONE),
-    );
+    // Error status is diagnostic, not namespace configuration. An enabled
+    // upstream must be retried or fail discovery explicitly, never disappear.
 
     // Fetch MCP servers for the specific namespace using a join query
     const servers = await db
@@ -133,7 +127,7 @@ export async function getMcpServers(
           logger.warn(
             `${params.type} server ${params.uuid} is missing url field, skipping`,
           );
-          continue;
+          throw new Error("Enabled upstream has no URL");
         }
       }
 
@@ -143,6 +137,6 @@ export async function getMcpServers(
     return serverDict;
   } catch (error) {
     logger.error("Error fetching active MCP servers from database:", error);
-    return {};
+    throw new Error("Namespace upstream configuration unavailable");
   }
 }

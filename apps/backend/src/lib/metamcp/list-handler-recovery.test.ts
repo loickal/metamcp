@@ -79,6 +79,7 @@ describe("requestWithSessionRecovery", () => {
     expect(pool.invalidateServerConnection).toHaveBeenCalledWith(
       "session-abc",
       "server-1",
+      stale,
     );
     expect(pool.getSession).toHaveBeenCalledWith(
       "session-abc",

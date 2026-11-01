@@ -1,7 +1,6 @@
 import { ServerParameters } from "@repo/zod-types";
 
-import logger from "@/utils/logger";
-
+import { mcpEvent } from "../mcp-diagnostics";
 import { ConnectedClient } from "./client";
 import { isRecoverableBackendError } from "./session-error";
 
@@ -13,6 +12,7 @@ export interface RecoverySessionPool {
   invalidateServerConnection(
     sessionId: string,
     serverUuid: string,
+    expected?: ConnectedClient,
   ): Promise<void>;
   getSession(
     sessionId: string,
@@ -73,13 +73,25 @@ export async function requestWithSessionRecovery<T>(
       throw error;
     }
 
-    logger.warn(
-      `Backend connection lost for server ${opts.serverUuid} (${opts.serverName}) on ${opts.operation}; invalidating pool and retrying once. (envelope: ${
-        error instanceof Error ? error.message : String(error)
-      })`,
+    mcpEvent(
+      "upstream_connection_failed",
+      {
+        namespace: opts.namespaceUuid,
+        upstream: opts.serverUuid,
+        operation: opts.operation,
+      },
+      opts.sessionId,
     );
-
-    await opts.pool.invalidateServerConnection(opts.sessionId, opts.serverUuid);
+    mcpEvent(
+      "upstream_recovery_attempt",
+      { upstream: opts.serverUuid },
+      opts.sessionId,
+    );
+    await opts.pool.invalidateServerConnection(
+      opts.sessionId,
+      opts.serverUuid,
+      opts.session,
+    );
 
     const fresh = await opts.pool.getSession(
       opts.sessionId,
@@ -94,6 +106,21 @@ export async function requestWithSessionRecovery<T>(
     }
 
     opts.onFreshSession?.(fresh);
-    return await opts.attempt(fresh);
+    try {
+      const result = await opts.attempt(fresh);
+      mcpEvent(
+        "upstream_recovery_completed",
+        { upstream: opts.serverUuid },
+        opts.sessionId,
+      );
+      return result;
+    } catch (error) {
+      mcpEvent(
+        "upstream_recovery_failed",
+        { upstream: opts.serverUuid },
+        opts.sessionId,
+      );
+      throw error;
+    }
   }
 }

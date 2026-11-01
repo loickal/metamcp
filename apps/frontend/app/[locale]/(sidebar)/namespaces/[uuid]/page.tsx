@@ -91,10 +91,10 @@ export default function NamespaceDetailPage({
   // MetaMCP Connection setup - connect to the metamcp proxy endpoint for this namespace
   const connection = useConnection({
     mcpServerUuid: uuid, // Using namespace UUID as the "server" UUID for connection
-    transportType: McpServerTypeEnum.enum.SSE,
+    transportType: McpServerTypeEnum.enum.STREAMABLE_HTTP,
     command: "", // Not needed for metamcp proxy
     args: "",
-    url: `/mcp-proxy/metamcp/${uuid}/sse`, // Connect to metamcp proxy endpoint
+    url: `/mcp-proxy/metamcp/${uuid}/mcp`, // Connect to metamcp proxy endpoint
     env: {},
     bearerToken: undefined,
     isMetaMCP: true, // Indicate this is a MetaMCP connection

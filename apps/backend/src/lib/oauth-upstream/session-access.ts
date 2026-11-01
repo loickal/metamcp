@@ -1,5 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 
+import { mcpEvent } from "../mcp-diagnostics";
+
 // Transport session IDs are not authorization credentials. Bind resumptions
 // and deletes to the authenticated caller and configured endpoint too.
 export function createSessionAccess() {
@@ -16,6 +18,7 @@ export function createSessionAccess() {
       auth.user?.id ?? auth.oauthUserId ?? auth.apiKeyUserId ?? null,
       auth.apiKeyUuid ?? null,
       auth.endpointName ?? req.params.uuid ?? null,
+      (req as Request & { namespaceUuid?: string }).namespaceUuid ?? null,
     ]);
   }
   return {
@@ -26,12 +29,26 @@ export function createSessionAccess() {
       owners.delete(id);
     },
     check(req: Request, res: Response, next: NextFunction) {
-      const id = req.get("mcp-session-id") ?? req.query.sessionId;
-      if (id && (typeof id !== "string" || owners.get(id) !== principal(req))) {
+      const headerId = req.get("mcp-session-id");
+      const queryId = req.query.sessionId;
+      const id = headerId ?? queryId;
+      if (
+        (headerId && queryId && headerId !== queryId) ||
+        (id && (typeof id !== "string" || owners.get(id) !== principal(req)))
+      ) {
+        mcpEvent(
+          "session_miss",
+          { namespace: req.params.uuid, endpoint: authEndpoint(req) },
+          typeof id === "string" ? id : undefined,
+        );
         res.status(404).end("Session not found");
         return;
       }
       next();
     },
   };
+}
+
+function authEndpoint(req: Request) {
+  return (req as Request & { endpointName?: string }).endpointName;
 }
