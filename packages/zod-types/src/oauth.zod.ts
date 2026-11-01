@@ -134,8 +134,7 @@ export const OAuthSessionSchema = z.object({
   uuid: z.string().uuid(),
   mcp_server_uuid: z.string().uuid(),
   client_information: OAuthClientInformationSchema.nullable(),
-  tokens: OAuthTokensSchema.nullable(),
-  code_verifier: z.string().nullable(),
+  connected: z.boolean(),
   created_at: z.string().datetime(),
   updated_at: z.string().datetime(),
 });
@@ -158,21 +157,18 @@ export const GetOAuthSessionResponseSchema = z.union([
   }),
 ]);
 
-// Upsert OAuth Session Request - all fields optional for updates.
-// `tokens` and `code_verifier` are NOT nullable: the atomic upsert in
-// `OAuthSessionsRepository.upsert` drops nullish values via the conditional
-// spread (omit = "do not touch"), so allowing `null` here would advertise a
-// "clear this column" contract the implementation does not honour.
-// `expected_state` is the CSRF-defence per-flow nonce written by the
-// frontend's `DbOAuthClientProvider.state()` and validated server-side at
-// `exchangeToken`. Optional (omit = "do not touch"); clearing is a dedicated
-// repo method, NOT a null write.
-export const UpsertOAuthSessionRequestSchema = z.object({
-  mcp_server_uuid: z.string().uuid(),
-  client_information: OAuthClientInformationSchema.optional(),
-  tokens: OAuthTokensSchema.optional(),
-  code_verifier: z.string().optional(),
-  expected_state: z.string().optional(),
+// Only pre-registered client configuration can be written by the browser.
+// Tokens, PKCE and state are exclusively managed by the backend.
+export const UpsertOAuthSessionRequestSchema = z
+  .object({
+    mcp_server_uuid: z.string().uuid(),
+    client_information: OAuthClientInformationSchema,
+  })
+  .strict();
+
+export const BeginOAuthRequestSchema = GetOAuthSessionRequestSchema;
+export const BeginOAuthResponseSchema = z.object({
+  authorization_url: z.string().url(),
 });
 
 // Upsert OAuth Session Response
@@ -205,7 +201,7 @@ export const ExchangeOAuthTokenRequestSchema = z.object({
   // Optional `state` parameter for CSRF defense. Echoed back from the
   // upstream redirect. Validated against an expected value when MetaMCP
   // gains per-flow state tracking (separate work).
-  state: z.string().optional(),
+  state: z.string().min(32).max(256),
 });
 
 // Upstream OAuth error envelope (RFC 6749 §5.2). Surfaced to the frontend
@@ -261,18 +257,22 @@ export const RefreshOAuthTokenResponseSchema = z.union([
 // response without `as unknown as OAuthTokens` casts.
 export const OAuthSessionCreateInputSchema = z.object({
   mcp_server_uuid: z.string(),
+  user_id: z.string().min(1),
   client_information: OAuthClientInformationSchema.optional(),
   tokens: UpstreamTokenResponseSchema.nullable().optional(),
   code_verifier: z.string().nullable().optional(),
-  expected_state: z.string().optional(),
+  expected_state: z.string().nullable().optional(),
+  flow_expires_at: z.date().nullable().optional(),
 });
 
 export const OAuthSessionUpdateInputSchema = z.object({
   mcp_server_uuid: z.string(),
+  user_id: z.string().min(1),
   client_information: OAuthClientInformationSchema.optional(),
   tokens: UpstreamTokenResponseSchema.nullable().optional(),
   code_verifier: z.string().nullable().optional(),
-  expected_state: z.string().optional(),
+  expected_state: z.string().nullable().optional(),
+  flow_expires_at: z.date().nullable().optional(),
 });
 
 // Export repository types
@@ -287,6 +287,8 @@ export type OAuthSessionUpdateInput = z.infer<
 export const DatabaseOAuthSessionSchema = z.object({
   uuid: z.string(),
   mcp_server_uuid: z.string(),
+  user_id: z.string(),
+  flow_expires_at: z.date().nullable(),
   client_information: OAuthClientInformationSchema.nullable(),
   tokens: UpstreamTokenResponseSchema.nullable(),
   code_verifier: z.string().nullable(),

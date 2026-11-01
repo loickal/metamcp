@@ -1,3 +1,4 @@
+import { createSessionAccess } from "../../lib/oauth-upstream/session-access";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import express from "express";
@@ -19,6 +20,7 @@ import { SessionLifetimeManagerImpl } from "../../lib/session-lifetime-manager";
 const sseRouter = express.Router();
 
 // Session lifetime manager for SSE sessions
+const sessionAccess = createSessionAccess();
 const sessionManager = new SessionLifetimeManagerImpl<Transport>("SSE");
 
 function getRequestContext(
@@ -53,6 +55,7 @@ const cleanupSession = async (sessionId: string, transport?: Transport) => {
 
     // Remove from session manager
     sessionManager.removeSession(sessionId);
+    sessionAccess.remove(sessionId);
 
     // Clean up MetaMCP server pool session
     await metaMcpServerPool.cleanupSession(sessionId);
@@ -62,6 +65,7 @@ const cleanupSession = async (sessionId: string, transport?: Transport) => {
     logger.error(`Error during cleanup of session ${sessionId}:`, error);
     // Even if cleanup fails, remove the session from manager to prevent memory leaks
     sessionManager.removeSession(sessionId);
+    sessionAccess.remove(sessionId);
     logger.info(`Removed orphaned session ${sessionId} due to cleanup error`);
     throw error;
   }
@@ -71,6 +75,7 @@ sseRouter.get(
   "/:endpoint_name/sse",
   lookupEndpoint,
   authenticateApiKey,
+  sessionAccess.check,
   rateLimitMiddleware,
   async (req, res) => {
     const authReq = req as ApiKeyAuthenticatedRequest;
@@ -115,6 +120,7 @@ sseRouter.get(
       );
 
       sessionManager.addSession(sessionId, webAppTransport);
+      sessionAccess.bind(sessionId, req);
 
       // Handle cleanup when connection closes
       res.on("close", async () => {
@@ -136,6 +142,7 @@ sseRouter.post(
   "/:endpoint_name/message",
   lookupEndpoint,
   authenticateApiKey,
+  sessionAccess.check,
   rateLimitMiddleware,
   async (req, res) => {
     // const authReq = req as ApiKeyAuthenticatedRequest;

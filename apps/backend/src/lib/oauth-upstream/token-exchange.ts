@@ -11,7 +11,7 @@
 // is known ahead of time (either from pre-registered client_information or
 // from discovery against the protected resource).
 
-import logger from "../../utils/logger";
+import { safeOAuthFetch, readOAuthJson } from "./safe-fetch";
 
 export type TokenEndpointAuthMethod =
   | "none"
@@ -63,6 +63,7 @@ interface PostFormInput {
   authMethod: TokenEndpointAuthMethod;
   clientId: string;
   clientSecret?: string;
+  resource?: string;
   fetchImpl?: typeof fetch;
 }
 
@@ -70,7 +71,7 @@ interface PostFormInput {
 export function redactToken(token: string | undefined | null): string {
   if (!token) return "<absent>";
   if (token.length <= 6) return "<short-redacted>";
-  return `${token.slice(0, 6)}***`;
+  return "<redacted>";
 }
 
 async function postFormToToken({
@@ -90,7 +91,9 @@ async function postFormToToken({
     if (!clientSecret) {
       throw new Error("client_secret_basic requires a client_secret");
     }
-    const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+    const basic = Buffer.from(
+      `${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret)}`,
+    ).toString("base64");
     headers.set("Authorization", `Basic ${basic}`);
   } else if (authMethod === "client_secret_post") {
     if (!clientSecret) {
@@ -103,16 +106,17 @@ async function postFormToToken({
     params.set("client_id", clientId);
   }
 
-  const doFetch = fetchImpl ?? fetch;
+  const doFetch = fetchImpl ?? safeOAuthFetch;
   const response = await doFetch(tokenEndpoint, {
     method: "POST",
     headers,
     body: params,
+    redirect: "error",
   });
 
   let payload: unknown;
   try {
-    payload = await response.json();
+    payload = await readOAuthJson(response);
   } catch {
     payload = null;
   }
@@ -157,6 +161,7 @@ export interface ExchangeAuthorizationCodeInput {
   clientId: string;
   clientSecret?: string;
   authMethod: TokenEndpointAuthMethod;
+  resource?: string;
   fetchImpl?: typeof fetch;
 }
 
@@ -169,6 +174,8 @@ export async function exchangeAuthorizationCode(
     code_verifier: input.codeVerifier,
     redirect_uri: input.redirectUri,
   });
+
+  if (input.resource) params.set("resource", input.resource);
 
   return postFormToToken({
     tokenEndpoint: input.tokenEndpoint,
@@ -187,6 +194,7 @@ export interface RefreshAccessTokenInput {
   clientSecret?: string;
   authMethod: TokenEndpointAuthMethod;
   scope?: string;
+  resource?: string;
   fetchImpl?: typeof fetch;
 }
 
@@ -200,6 +208,8 @@ export async function refreshAccessToken(
   if (input.scope) {
     params.set("scope", input.scope);
   }
+
+  if (input.resource) params.set("resource", input.resource);
 
   const tokens = await postFormToToken({
     tokenEndpoint: input.tokenEndpoint,
@@ -227,88 +237,6 @@ export interface OAuthAuthorizationServerMetadata {
   scopes_supported?: string[];
   token_endpoint_auth_methods_supported?: string[];
   grant_types_supported?: string[];
-}
-
-// Server-side discovery against `/.well-known/oauth-authorization-server`.
-// Returns null on any *absence* condition (network error, 4xx/5xx, invalid
-// URL) so callers can fall back to client_information or the `/token`
-// path. **Throws** on malformed 2xx responses — silently dropping a
-// misconfigured provider's metadata would mask real upstream bugs.
-export async function discoverAuthorizationServerMetadata(
-  serverUrl: string,
-  fetchImpl: typeof fetch = fetch,
-): Promise<OAuthAuthorizationServerMetadata | null> {
-  let wellKnownUrl: URL;
-  try {
-    wellKnownUrl = new URL(
-      "/.well-known/oauth-authorization-server",
-      serverUrl,
-    );
-  } catch {
-    return null;
-  }
-
-  let response: Response;
-  try {
-    response = await fetchImpl(wellKnownUrl, {
-      headers: { Accept: "application/json" },
-    });
-  } catch (error) {
-    logger.warn(
-      `OAuth discovery failed at ${wellKnownUrl.href}: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
-    return null;
-  }
-  if (!response.ok) return null;
-
-  // 2xx but malformed: this is a real upstream bug. Throw so the caller's
-  // error path (exchangeToken/refreshToken) surfaces it as
-  // `discovery_malformed` rather than silently behaving as if discovery
-  // wasn't supported.
-  let data: unknown;
-  try {
-    data = await response.json();
-  } catch (error) {
-    throw new Error(
-      `OAuth discovery at ${wellKnownUrl.href} returned 2xx but body was not JSON: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
-  }
-  if (!data || typeof data !== "object") {
-    throw new Error(
-      `OAuth discovery at ${wellKnownUrl.href} returned 2xx but body was not a JSON object`,
-    );
-  }
-  return data as OAuthAuthorizationServerMetadata;
-}
-
-// Determine the token endpoint to POST against. Priority:
-//   1. `client_information.token_endpoint` (set by the pre-registered-client
-//      UI for providers like Salesforce that publish the endpoint OOB)
-//   2. The `token_endpoint` returned by `.well-known` discovery
-//   3. Fallback to `<server_url>/token` (matches the MCP SDK's behavior)
-export function resolveTokenEndpoint(args: {
-  clientInformation: Record<string, unknown> | null | undefined;
-  discovered: OAuthAuthorizationServerMetadata | null;
-  serverUrl: string;
-}): string {
-  const ci = args.clientInformation as
-    | { token_endpoint?: unknown }
-    | null
-    | undefined;
-  if (typeof ci?.token_endpoint === "string" && ci.token_endpoint.length > 0) {
-    return ci.token_endpoint;
-  }
-  if (
-    args.discovered?.token_endpoint &&
-    typeof args.discovered.token_endpoint === "string"
-  ) {
-    return args.discovered.token_endpoint;
-  }
-  return new URL("/token", args.serverUrl).toString();
 }
 
 // Pick the token endpoint auth method, honoring (in order):

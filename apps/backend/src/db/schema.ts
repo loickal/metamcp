@@ -1,9 +1,7 @@
-import { OAuthClientInformation } from "@modelcontextprotocol/sdk/shared/auth.js";
 import {
   McpServerErrorStatusEnum,
   McpServerStatusEnum,
   McpServerTypeEnum,
-  UpstreamTokenResponse,
 } from "@repo/zod-types";
 import { sql } from "drizzle-orm";
 import {
@@ -105,22 +103,15 @@ export const oauthSessionsTable = pgTable(
     mcp_server_uuid: uuid("mcp_server_uuid")
       .notNull()
       .references(() => mcpServersTable.uuid, { onDelete: "cascade" }),
-    client_information: jsonb("client_information")
-      .$type<OAuthClientInformation>()
+    user_id: text("user_id")
       .notNull()
-      .default(sql`'{}'::jsonb`),
-    // Typed as UpstreamTokenResponse (RFC 6749 + .passthrough()) rather
-    // than the MCP SDK's narrow OAuthTokens so providers' extra response
-    // fields (Salesforce `instance_url`, OIDC `id_token`, Microsoft
-    // `ext_expires_in`, ...) round-trip without `as unknown as` casts at
-    // the call sites.
-    tokens: jsonb("tokens").$type<UpstreamTokenResponse>(),
+      .references(() => usersTable.id, { onDelete: "cascade" }),
+    flow_expires_at: timestamp("flow_expires_at", { withTimezone: true }),
+    client_information: jsonb("client_information").$type<string>(),
+    // JSONB strings contain authenticated ciphertext; only the repository decrypts.
+    tokens: jsonb("tokens").$type<string>(),
     code_verifier: text("code_verifier"),
-    // CSRF defence (RFC 6749 §10.12). Generated server-side at the
-    // authorize-redirect step (`DbOAuthClientProvider.state()`), compared
-    // against the upstream's echoed `state` at token exchange, and cleared
-    // on success (one-shot). NEVER returned to the frontend — the
-    // serializer strips it.
+    // SHA-256 state digest, consumed atomically before exchanging the code.
     expected_state: text("expected_state"),
     created_at: timestamp("created_at", { withTimezone: true })
       .notNull()
@@ -131,7 +122,10 @@ export const oauthSessionsTable = pgTable(
   },
   (table) => [
     index("oauth_sessions_mcp_server_uuid_idx").on(table.mcp_server_uuid),
-    unique("oauth_sessions_unique_per_server_idx").on(table.mcp_server_uuid),
+    unique("oauth_sessions_user_server_idx").on(
+      table.user_id,
+      table.mcp_server_uuid,
+    ),
   ],
 );
 

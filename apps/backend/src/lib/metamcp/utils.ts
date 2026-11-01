@@ -2,8 +2,6 @@ import { DatabaseMcpServer, ServerParameters } from "@repo/zod-types";
 
 import logger from "@/utils/logger";
 
-import { oauthSessionsRepository } from "../../db/repositories/oauth-sessions.repo";
-
 /**
  * Environment variables to inherit by default, if an environment is not explicitly given.
  */
@@ -86,22 +84,6 @@ export async function convertDbServerToParams(
   server: DatabaseMcpServer,
 ): Promise<ServerParameters | null> {
   try {
-    // Fetch OAuth tokens from OAuth sessions table
-    const oauthSession = await oauthSessionsRepository.findByMcpServerUuid(
-      server.uuid,
-    );
-    let oauthTokens = null;
-
-    if (oauthSession && oauthSession.tokens) {
-      oauthTokens = {
-        access_token: oauthSession.tokens.access_token,
-        token_type: oauthSession.tokens.token_type,
-        expires_in: oauthSession.tokens.expires_in,
-        scope: oauthSession.tokens.scope,
-        refresh_token: oauthSession.tokens.refresh_token,
-      };
-    }
-
     const params: ServerParameters = {
       uuid: server.uuid,
       name: server.name,
@@ -114,7 +96,7 @@ export async function convertDbServerToParams(
       created_at: server.created_at?.toISOString() || new Date().toISOString(),
       status: "active", // Default status for non-namespace servers
       stderr: "inherit" as const,
-      oauth_tokens: oauthTokens,
+      oauth_tokens: null,
       bearerToken: server.bearerToken,
       headers: server.headers || {},
       forward_headers: server.forward_headers || {},

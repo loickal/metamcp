@@ -38,6 +38,7 @@ export const createOriginalListToolsHandler = (
     const serverParams = await getMcpServers(
       context.namespaceUuid,
       includeInactiveServers,
+      context.auth?.oauthUserId ?? context.auth?.apiKeyUserId,
     );
     const allTools: Tool[] = [];
 
@@ -118,7 +119,11 @@ export const createOriginalCallToolHandler = (): CallToolHandler => {
     const originalToolName = name.substring(firstDoubleUnderscoreIndex + 2);
 
     // Get server parameters and find the right session for this tool
-    const serverParams = await getMcpServers(context.namespaceUuid);
+    const serverParams = await getMcpServers(
+      context.namespaceUuid,
+      false,
+      context.auth?.oauthUserId ?? context.auth?.apiKeyUserId,
+    );
     let targetSession = null;
 
     for (const [mcpServerUuid, params] of Object.entries(serverParams)) {

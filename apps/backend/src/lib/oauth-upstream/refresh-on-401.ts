@@ -1,35 +1,14 @@
-// Server-side refresh-on-401 helper for the upstream proxy path.
-//
-// The backend's MCP client (`apps/backend/src/lib/metamcp/client.ts`) does
-// not pass an OAuthClientProvider into the SDK transports, so the SDK has
-// no built-in path to refresh tokens when the upstream returns 401. This
-// helper closes that gap: it reads the persisted oauth_sessions row,
-// POSTs `grant_type=refresh_token` to the upstream's token endpoint, and
-// persists the new tokens back into the DB so the next connection attempt
-// picks them up.
-//
-// Concurrency: an in-process per-server mutex (`inFlightRefreshes`)
-// collapses simultaneous refresh attempts for the same MCP server into
-// one upstream POST. Without this, providers that rotate refresh tokens
-// (Google, Microsoft, Okta with rotation enabled) would consume the
-// refresh_token on the first attempt and reject the second with
-// `invalid_grant`, leaving one of the two connections stranded. The
-// mutex is in-process only; multi-instance deployments still race across
-// processes (acceptable cost for now — a DB-level CAS would be the
-// follow-up).
-//
-// Acceptance criterion #3 from the OAuth-CORS-fix PR.
+// Server-side refresh grants. The in-process mutex is scoped to user + server;
+// tokens and client configuration are read and written with the same identity.
+// Multi-replica refresh serialization remains a deployment limitation.
 
 import { ServerParameters } from "@repo/zod-types";
 
 import { oauthSessionsRepository } from "../../db/repositories";
 import logger from "../../utils/logger";
 import {
-  discoverAuthorizationServerMetadata,
   OAuthTokens,
-  redactToken,
   refreshAccessToken,
-  resolveTokenEndpoint,
   resolveTokenEndpointAuthMethod,
   UpstreamTokenError,
 } from "./token-exchange";
@@ -60,9 +39,14 @@ export const inFlightRefreshes = new Map<string, Promise<RefreshResult>>();
 // NOTE: This is intentionally safe to call repeatedly — it short-circuits
 // when there is no refresh_token or no client_id to use.
 export async function tryRefreshUpstreamTokens(
-  serverParams: Pick<ServerParameters, "uuid" | "name" | "url">,
+  serverParams: Pick<
+    ServerParameters,
+    "uuid" | "name" | "url" | "oauth_user_id"
+  >,
 ): Promise<RefreshResult> {
-  const inFlight = inFlightRefreshes.get(serverParams.uuid);
+  if (!serverParams.oauth_user_id) return { status: "no_session" };
+  const key = JSON.stringify([serverParams.oauth_user_id, serverParams.uuid]);
+  const inFlight = inFlightRefreshes.get(key);
   if (inFlight) {
     logger.info(
       `[oauth] refresh already in flight for ${serverParams.uuid}; joining`,
@@ -73,22 +57,26 @@ export async function tryRefreshUpstreamTokens(
     try {
       return await doRefresh(serverParams);
     } finally {
-      inFlightRefreshes.delete(serverParams.uuid);
+      inFlightRefreshes.delete(key);
     }
   })();
-  inFlightRefreshes.set(serverParams.uuid, promise);
+  inFlightRefreshes.set(key, promise);
   return promise;
 }
 
 async function doRefresh(
-  serverParams: Pick<ServerParameters, "uuid" | "name" | "url">,
+  serverParams: Pick<
+    ServerParameters,
+    "uuid" | "name" | "url" | "oauth_user_id"
+  >,
 ): Promise<RefreshResult> {
-  if (!serverParams.url) {
+  if (!serverParams.url || !serverParams.oauth_user_id) {
     return { status: "no_session" };
   }
 
   const session = await oauthSessionsRepository.findByMcpServerUuid(
     serverParams.uuid,
+    serverParams.oauth_user_id,
   );
   if (!session) {
     return { status: "no_session" };
@@ -117,31 +105,27 @@ async function doRefresh(
       ? (clientInformation.client_secret as string)
       : undefined;
 
-  const discovered = await discoverAuthorizationServerMetadata(
-    serverParams.url,
-  );
-  const tokenEndpoint = resolveTokenEndpoint({
-    clientInformation,
-    discovered,
-    serverUrl: serverParams.url,
-  });
+  if (
+    clientInformation?.server_url !== serverParams.url ||
+    typeof clientInformation?.token_endpoint !== "string"
+  ) {
+    return { status: "no_session" };
+  }
+  const tokenEndpoint = clientInformation.token_endpoint;
   const authMethod = resolveTokenEndpointAuthMethod({
     clientInformation,
-    discovered,
+    discovered: null,
     hasSecret: Boolean(clientSecret),
   });
-
-  logger.info(
-    `[oauth] proxy 401 → refreshing tokens — server=${serverParams.uuid} ` +
-      `(${serverParams.name}) token_endpoint=${tokenEndpoint} ` +
-      `auth_method=${authMethod} ` +
-      `refresh_token=${redactToken(currentTokens.refresh_token)}`,
-  );
 
   let newTokens: OAuthTokens;
   try {
     newTokens = await refreshAccessToken({
       tokenEndpoint,
+      resource:
+        typeof clientInformation.resource === "string"
+          ? clientInformation.resource
+          : undefined,
       refreshToken: currentTokens.refresh_token,
       clientId,
       clientSecret,
@@ -155,34 +139,27 @@ async function doRefresh(
     if (error instanceof UpstreamTokenError) {
       logger.warn(
         `[oauth] proxy refresh failed — server=${serverParams.uuid} ` +
-          `status=${error.status} error=${error.oauthError?.error ?? "unknown"}`,
+          `status=${error.status}`,
       );
       return {
         status: "failed",
         error: error.oauthError?.error ?? "upstream_error",
-        errorDescription: error.oauthError?.error_description ?? error.message,
+        errorDescription: "OAuth refresh failed",
         upstreamStatus: error.status,
       };
     }
-    logger.error(
-      `[oauth] proxy refresh threw — server=${serverParams.uuid}:`,
-      error,
-    );
+    logger.warn(`[oauth] proxy refresh failed — server=${serverParams.uuid}`);
     return {
       status: "failed",
-      error: error instanceof Error ? error.message : "internal_error",
+      error: "refresh_failed",
     };
   }
 
   await oauthSessionsRepository.upsert({
     mcp_server_uuid: serverParams.uuid,
+    user_id: serverParams.oauth_user_id,
     tokens: newTokens,
   });
-
-  logger.info(
-    `[oauth] proxy refresh succeeded — server=${serverParams.uuid} ` +
-      `access_token=${redactToken(newTokens.access_token)}`,
-  );
 
   return { status: "refreshed", tokens: newTokens };
 }

@@ -1,12 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  discoverAuthorizationServerMetadata,
   exchangeAuthorizationCode,
   isUpstreamUnauthorizedError,
   redactToken,
   refreshAccessToken,
-  resolveTokenEndpoint,
   resolveTokenEndpointAuthMethod,
   UpstreamTokenError,
 } from "./token-exchange";
@@ -34,8 +32,8 @@ describe("redactToken", () => {
     expect(redactToken("abc")).toBe("<short-redacted>");
     expect(redactToken("123456")).toBe("<short-redacted>");
   });
-  it("keeps a short prefix and masks the rest", () => {
-    expect(redactToken("00D5g000xyzabcdef")).toBe("00D5g0***");
+  it("never logs token prefixes", () => {
+    expect(redactToken("00D5g000xyzabcdef")).toBe("<redacted>");
   });
 });
 
@@ -251,103 +249,6 @@ describe("refreshAccessToken", () => {
 
     expect(err).toBeInstanceOf(UpstreamTokenError);
     expect((err as UpstreamTokenError).oauthError?.error).toBe("invalid_grant");
-  });
-});
-
-describe("discoverAuthorizationServerMetadata", () => {
-  it("returns the metadata on 2xx", async () => {
-    const fetchImpl = vi.fn<FetchImpl>(async (url) => {
-      expect(String(url)).toBe(
-        "https://api.example.com/.well-known/oauth-authorization-server",
-      );
-      return jsonResponse(200, {
-        issuer: "https://api.example.com",
-        token_endpoint: "https://api.example.com/oauth/token",
-        authorization_endpoint: "https://api.example.com/oauth/authorize",
-      });
-    });
-
-    const metadata = await discoverAuthorizationServerMetadata(
-      "https://api.example.com/mcp",
-      fetchImpl,
-    );
-    expect(metadata?.token_endpoint).toBe(
-      "https://api.example.com/oauth/token",
-    );
-  });
-
-  it("returns null on 404", async () => {
-    const fetchImpl = vi.fn<FetchImpl>(async () => textResponse(404, ""));
-    const metadata = await discoverAuthorizationServerMetadata(
-      "https://api.example.com/mcp",
-      fetchImpl,
-    );
-    expect(metadata).toBeNull();
-  });
-
-  it("returns null when fetch throws (CORS, DNS, ...)", async () => {
-    const fetchImpl = vi.fn<FetchImpl>(async () => {
-      throw new Error("network error");
-    });
-    const metadata = await discoverAuthorizationServerMetadata(
-      "https://api.example.com",
-      fetchImpl,
-    );
-    expect(metadata).toBeNull();
-  });
-
-  it("THROWS on 2xx with non-JSON body (real upstream bug, not absence)", async () => {
-    const fetchImpl = vi.fn<FetchImpl>(
-      async () => new Response("<html>not json</html>", { status: 200 }),
-    );
-    await expect(
-      discoverAuthorizationServerMetadata(
-        "https://api.example.com/mcp",
-        fetchImpl,
-      ),
-    ).rejects.toThrow(/not JSON|not a JSON/i);
-  });
-
-  it("THROWS on 2xx with a JSON primitive (not an object)", async () => {
-    const fetchImpl = vi.fn<FetchImpl>(async () => jsonResponse(200, "string"));
-    await expect(
-      discoverAuthorizationServerMetadata(
-        "https://api.example.com/mcp",
-        fetchImpl,
-      ),
-    ).rejects.toThrow(/JSON object/i);
-  });
-});
-
-describe("resolveTokenEndpoint", () => {
-  it("prefers client_information.token_endpoint when set", () => {
-    expect(
-      resolveTokenEndpoint({
-        clientInformation: { token_endpoint: "https://upstream/oauth/token" },
-        discovered: { token_endpoint: "https://discovered/token" },
-        serverUrl: "https://server/mcp",
-      }),
-    ).toBe("https://upstream/oauth/token");
-  });
-
-  it("falls back to discovered token_endpoint when client_information lacks it", () => {
-    expect(
-      resolveTokenEndpoint({
-        clientInformation: { client_id: "x" },
-        discovered: { token_endpoint: "https://discovered/token" },
-        serverUrl: "https://server/mcp",
-      }),
-    ).toBe("https://discovered/token");
-  });
-
-  it("falls back to <serverUrl>/token when neither source has an endpoint", () => {
-    expect(
-      resolveTokenEndpoint({
-        clientInformation: null,
-        discovered: null,
-        serverUrl: "https://server.example.com/mcp",
-      }),
-    ).toBe("https://server.example.com/token");
   });
 });
 

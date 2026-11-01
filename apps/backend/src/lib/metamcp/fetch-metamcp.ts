@@ -18,6 +18,7 @@ export type IOType = "overlapped" | "pipe" | "ignore" | "inherit";
 export async function getMcpServers(
   namespaceUuid: string,
   includeInactiveServers: boolean = false,
+  userId?: string,
 ): Promise<Record<string, ServerParameters>> {
   try {
     // Build the where conditions based on includeInactiveServers flag
@@ -44,6 +45,7 @@ export async function getMcpServers(
     const servers = await db
       .select({
         uuid: mcpServersTable.uuid,
+        user_id: mcpServersTable.user_id,
         name: mcpServersTable.name,
         description: mcpServersTable.description,
         type: mcpServersTable.type,
@@ -68,12 +70,23 @@ export async function getMcpServers(
     const serverDict: Record<string, ServerParameters> = {};
     for (const server of servers) {
       // Fetch OAuth tokens from OAuth sessions table
-      const oauthSession = await oauthSessionsRepository.findByMcpServerUuid(
-        server.uuid,
-      );
+      // Public configurations do not grant access to anybody else's credentials.
+      const authorizedUser =
+        userId && (!server.user_id || server.user_id === userId)
+          ? userId
+          : undefined;
+      const oauthSession = authorizedUser
+        ? await oauthSessionsRepository.findByMcpServerUuid(
+            server.uuid,
+            authorizedUser,
+          )
+        : undefined;
       let oauthTokens = null;
 
-      if (oauthSession && oauthSession.tokens) {
+      if (
+        oauthSession?.tokens &&
+        oauthSession.client_information?.server_url === server.url
+      ) {
         oauthTokens = {
           access_token: oauthSession.tokens.access_token,
           token_type: oauthSession.tokens.token_type,
@@ -100,6 +113,7 @@ export async function getMcpServers(
         error_status: server.error_status?.toLowerCase(),
         stderr: "inherit" as IOType,
         oauth_tokens: oauthTokens,
+        oauth_user_id: authorizedUser,
         bearerToken: server.bearerToken,
       };
 

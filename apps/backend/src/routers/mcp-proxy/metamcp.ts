@@ -1,3 +1,4 @@
+import { createSessionAccess } from "../../lib/oauth-upstream/session-access";
 import { randomUUID } from "node:crypto";
 
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
@@ -15,6 +16,8 @@ const metamcpRouter = express.Router();
 
 // Apply better auth middleware to all metamcp routes
 metamcpRouter.use(betterAuthMcpMiddleware);
+const sessionAccess = createSessionAccess();
+metamcpRouter.use(sessionAccess.check);
 
 const webAppTransports: Map<string, Transport> = new Map<string, Transport>(); // Web app transports by sessionId
 const metamcpServers: Map<
@@ -30,11 +33,17 @@ const createMetaMcpServer = async (
   namespaceUuid: string,
   sessionId: string,
   includeInactiveServers: boolean = false,
+  userId?: string,
 ) => {
   const { server, cleanup } = await createServer(
     namespaceUuid,
     sessionId,
     includeInactiveServers,
+    undefined,
+    {
+      endpointName: "inspector",
+      auth: { method: "none", sessionUserId: userId },
+    },
   );
   return { server, cleanup };
 };
@@ -42,6 +51,7 @@ const createMetaMcpServer = async (
 // Cleanup function for a specific session
 const cleanupSession = async (sessionId: string) => {
   logger.info(`Cleaning up session ${sessionId}`);
+  sessionAccess.remove(sessionId);
 
   // Clean up transport
   const transport = webAppTransports.get(sessionId);
@@ -112,12 +122,14 @@ metamcpRouter.post("/:uuid/mcp", async (req, res) => {
               namespaceUuid,
               newSessionId,
               includeInactiveServers,
+              (req as express.Request & { user?: { id: string } }).user?.id,
             );
             logger.info(
               `Created MetaMCP server instance for session ${newSessionId}`,
             );
 
             webAppTransports.set(newSessionId, webAppTransport);
+            sessionAccess.bind(newSessionId, req);
             metamcpServers.set(newSessionId, mcpServerInstance);
 
             logger.info(
@@ -215,10 +227,12 @@ metamcpRouter.get("/:uuid/sse", async (req, res) => {
       namespaceUuid,
       sessionId,
       includeInactiveServers,
+      (req as express.Request & { user?: { id: string } }).user?.id,
     );
     logger.info(`Created MetaMCP server instance for session ${sessionId}`);
 
     webAppTransports.set(sessionId, webAppTransport);
+    sessionAccess.bind(sessionId, req);
     metamcpServers.set(sessionId, mcpServerInstance);
 
     // Handle cleanup when connection closes

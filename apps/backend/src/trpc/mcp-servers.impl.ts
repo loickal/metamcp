@@ -60,6 +60,8 @@ export const mcpServersImplementations = {
             createdServer.uuid,
             oauthClientInfo,
             oauthSessionsRepository,
+            userId,
+            createdServer.url ?? "",
           );
         } catch (error) {
           logger.error(
@@ -412,6 +414,8 @@ export const mcpServersImplementations = {
             updatedServer.uuid,
             oauthClientInfo,
             oauthSessionsRepository,
+            userId,
+            updatedServer.url ?? "",
           );
         } catch (error) {
           logger.error(

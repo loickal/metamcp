@@ -18,6 +18,7 @@ export const ServerParametersSchema = z.object({
   created_at: z.string(),
   status: z.string(),
   error_status: z.string().optional(),
+  oauth_user_id: z.string().optional(),
   oauth_tokens: OAuthTokensSchema.nullable().optional(),
   bearerToken: z.string().nullable().optional(),
   headers: z.record(z.string(), z.string()).nullable().optional(),

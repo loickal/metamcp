@@ -1,3 +1,4 @@
+import { createSessionAccess } from "../../lib/oauth-upstream/session-access";
 import { randomUUID } from "node:crypto";
 
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -20,6 +21,7 @@ import { SessionLifetimeManagerImpl } from "../../lib/session-lifetime-manager";
 const streamableHttpRouter = express.Router();
 
 // Session lifetime manager for StreamableHTTP sessions
+const sessionAccess = createSessionAccess();
 const sessionManager =
   new SessionLifetimeManagerImpl<StreamableHTTPServerTransport>(
     "StreamableHTTP",
@@ -86,6 +88,7 @@ const cleanupSession = async (
 
     // Remove from session manager
     sessionManager.removeSession(sessionId);
+    sessionAccess.remove(sessionId);
 
     // Clean up MetaMCP server pool session
     await metaMcpServerPool.cleanupSession(sessionId);
@@ -95,6 +98,7 @@ const cleanupSession = async (
     logger.error(`Error during cleanup of session ${sessionId}:`, error);
     // Even if cleanup fails, remove the session from manager to prevent memory leaks
     sessionManager.removeSession(sessionId);
+    sessionAccess.remove(sessionId);
     logger.info(`Removed orphaned session ${sessionId} due to cleanup error`);
     throw error;
   }
@@ -120,6 +124,7 @@ streamableHttpRouter.get(
   "/:endpoint_name/mcp",
   lookupEndpoint,
   authenticateApiKey,
+  sessionAccess.check,
   rateLimitMiddleware,
   async (req, res) => {
     // const authReq = req as ApiKeyAuthenticatedRequest;
@@ -155,6 +160,7 @@ streamableHttpRouter.post(
   "/:endpoint_name/mcp",
   lookupEndpoint,
   authenticateApiKey,
+  sessionAccess.check,
   rateLimitMiddleware,
   async (req, res) => {
     const authReq = req as ApiKeyAuthenticatedRequest;
@@ -236,6 +242,7 @@ streamableHttpRouter.post(
 
         // Store transport reference
         sessionManager.addSession(newSessionId, transport);
+        sessionAccess.bind(newSessionId, req);
 
         logger.info(
           `Public Endpoint Client <-> Proxy sessionId: ${newSessionId} for endpoint ${endpointName} -> namespace ${namespaceUuid}`,
@@ -315,6 +322,7 @@ streamableHttpRouter.delete(
   "/:endpoint_name/mcp",
   lookupEndpoint,
   authenticateApiKey,
+  sessionAccess.check,
   rateLimitMiddleware,
   async (req, res) => {
     const authReq = req as ApiKeyAuthenticatedRequest;

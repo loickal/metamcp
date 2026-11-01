@@ -1,4 +1,6 @@
 import {
+  BeginOAuthRequestSchema,
+  BeginOAuthResponseSchema,
   ExchangeOAuthTokenRequestSchema,
   ExchangeOAuthTokenResponseSchema,
   GetOAuthSessionRequestSchema,
@@ -17,11 +19,17 @@ import { protectedProcedure, router } from "../../trpc";
 export const createOAuthRouter = (
   // These are the implementation functions that the backend will provide
   implementations: {
+    begin: (
+      input: z.infer<typeof BeginOAuthRequestSchema>,
+      userId: string,
+    ) => Promise<z.infer<typeof BeginOAuthResponseSchema>>;
     get: (
       input: z.infer<typeof GetOAuthSessionRequestSchema>,
+      userId: string,
     ) => Promise<z.infer<typeof GetOAuthSessionResponseSchema>>;
     upsert: (
       input: z.infer<typeof UpsertOAuthSessionRequestSchema>,
+      userId: string,
     ) => Promise<z.infer<typeof UpsertOAuthSessionResponseSchema>>;
     exchangeToken: (
       input: z.infer<typeof ExchangeOAuthTokenRequestSchema>,
@@ -34,20 +42,24 @@ export const createOAuthRouter = (
   },
 ) => {
   return router({
+    begin: protectedProcedure
+      .input(BeginOAuthRequestSchema)
+      .output(BeginOAuthResponseSchema)
+      .mutation(({ input, ctx }) => implementations.begin(input, ctx.user.id)),
     // Protected: Get OAuth session by MCP server UUID
     get: protectedProcedure
       .input(GetOAuthSessionRequestSchema)
       .output(GetOAuthSessionResponseSchema)
-      .query(async ({ input }) => {
-        return await implementations.get(input);
+      .query(async ({ input, ctx }) => {
+        return await implementations.get(input, ctx.user.id);
       }),
 
     // Protected: Upsert OAuth session
     upsert: protectedProcedure
       .input(UpsertOAuthSessionRequestSchema)
       .output(UpsertOAuthSessionResponseSchema)
-      .mutation(async ({ input }) => {
-        return await implementations.upsert(input);
+      .mutation(async ({ input, ctx }) => {
+        return await implementations.upsert(input, ctx.user.id);
       }),
 
     // Protected: Server-side authorization-code-to-tokens exchange. This

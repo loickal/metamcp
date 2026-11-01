@@ -1,3 +1,6 @@
+vi.mock("../lib/oauth-upstream/safe-fetch", () => ({
+  validateOAuthUrl: vi.fn(),
+}));
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { OAuthSessionsRepository } from "../db/repositories/oauth-sessions.repo";
@@ -171,11 +174,18 @@ describe("persistPreRegisteredOAuthClient", () => {
         token_endpoint_auth_method: "client_secret_post",
       },
       mockRepo,
+      "user-a",
+      "https://resource.example/mcp",
     );
 
     expect(mockRepo.upsert).toHaveBeenCalledTimes(1);
     expect(mockRepo.upsert).toHaveBeenCalledWith({
       mcp_server_uuid: SERVER_UUID,
+      user_id: "user-a",
+      tokens: null,
+      code_verifier: null,
+      expected_state: null,
+      flow_expires_at: null,
       client_information: expect.objectContaining({
         client_id: "3MVG9",
         client_secret: "shh",
@@ -199,9 +209,14 @@ describe("persistPreRegisteredOAuthClient", () => {
       SERVER_UUID,
       { client_id: "" },
       mockRepo,
+      "user-a",
+      "https://resource.example/mcp",
     );
 
-    expect(mockRepo.findByMcpServerUuid).toHaveBeenCalledWith(SERVER_UUID);
+    expect(mockRepo.findByMcpServerUuid).toHaveBeenCalledWith(
+      SERVER_UUID,
+      "user-a",
+    );
     expect(mockRepo.upsert).not.toHaveBeenCalled();
     expect(mockRepo.deleteByMcpServerUuid).not.toHaveBeenCalled();
   });
@@ -218,9 +233,14 @@ describe("persistPreRegisteredOAuthClient", () => {
       SERVER_UUID,
       { client_id: "" },
       mockRepo,
+      "user-a",
+      "https://resource.example/mcp",
     );
 
-    expect(mockRepo.deleteByMcpServerUuid).toHaveBeenCalledWith(SERVER_UUID);
+    expect(mockRepo.deleteByMcpServerUuid).toHaveBeenCalledWith(
+      SERVER_UUID,
+      "user-a",
+    );
     expect(mockRepo.upsert).not.toHaveBeenCalled();
   });
 });

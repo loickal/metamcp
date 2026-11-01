@@ -40,7 +40,11 @@ export const executeToolWithMiddleware = async (
     }
 
     // Use deterministic session ID for OpenAPI endpoints
-    const sessionId = `openapi_${namespaceUuid}`;
+    const sessionId = JSON.stringify([
+      "openapi",
+      namespaceUuid,
+      req.oauthUserId ?? req.apiKeyUserId ?? null,
+    ]);
 
     // Create middleware-enabled handlers
     const { handlerContext, callToolWithMiddleware } =

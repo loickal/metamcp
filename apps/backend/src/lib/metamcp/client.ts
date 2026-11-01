@@ -8,9 +8,9 @@ import { ServerParameters } from "@repo/zod-types";
 import logger from "@/utils/logger";
 
 import { oauthSessionsRepository } from "../../db/repositories";
-import { tryRefreshUpstreamTokens } from "../oauth-upstream/refresh-on-401";
 import { recoverFromPostAuthRace } from "../oauth-upstream/retry-post-auth";
 import { isUpstreamUnauthorizedError } from "../oauth-upstream/token-exchange";
+import { createUpstreamFetch } from "../oauth-upstream/upstream-fetch";
 import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
 import { metamcpLogStore } from "./log-store";
 import { serverErrorTracker } from "./server-error-tracker";
@@ -20,6 +20,7 @@ const sleep = (time: number) =>
   new Promise<void>((resolve) => setTimeout(() => resolve(), time));
 
 export interface ConnectedClient {
+  oauthUserId?: string;
   client: Client;
   cleanup: () => Promise<void>;
   onProcessCrash?: (exitCode: number | null, signal: string | null) => void;
@@ -90,9 +91,8 @@ export const createMetaMcpClient = (
       ...(serverParams.headers || {}),
     };
 
-    // Check for authentication - prioritize OAuth tokens, fallback to bearerToken
-    const authToken =
-      serverParams.oauth_tokens?.access_token || serverParams.bearerToken;
+    // Static configuration only. Personal OAuth tokens are attached by the fetch wrapper.
+    const authToken = serverParams.bearerToken;
     if (authToken) {
       headers["Authorization"] = `Bearer ${authToken}`;
     }
@@ -100,14 +100,33 @@ export const createMetaMcpClient = (
     const hasHeaders = Object.keys(headers).length > 0;
 
     if (!hasHeaders) {
-      transport = new SSEClientTransport(new URL(transformedUrl));
+      transport = new SSEClientTransport(new URL(transformedUrl), {
+        fetch: createUpstreamFetch(
+          { ...serverParams, url: serverParams.url },
+          serverParams.oauth_user_id,
+        ),
+        eventSourceInit: {
+          fetch: createUpstreamFetch(
+            { ...serverParams, url: serverParams.url },
+            serverParams.oauth_user_id,
+          ),
+        },
+      });
     } else {
       transport = new SSEClientTransport(new URL(transformedUrl), {
+        fetch: createUpstreamFetch(
+          { ...serverParams, url: serverParams.url },
+          serverParams.oauth_user_id,
+        ),
         requestInit: {
           headers,
         },
         eventSourceInit: {
-          fetch: (url, init) => fetch(url, { ...init, headers }),
+          fetch: (url, init) =>
+            createUpstreamFetch(
+              { ...serverParams, url: serverParams.url! },
+              serverParams.oauth_user_id,
+            )(url, { ...init, headers }),
         },
       });
     }
@@ -120,9 +139,8 @@ export const createMetaMcpClient = (
       ...(serverParams.headers || {}),
     };
 
-    // Check for authentication - prioritize OAuth tokens, fallback to bearerToken
-    const authToken =
-      serverParams.oauth_tokens?.access_token || serverParams.bearerToken;
+    // Static configuration only. Personal OAuth tokens are attached by the fetch wrapper.
+    const authToken = serverParams.bearerToken;
     if (authToken) {
       headers["Authorization"] = `Bearer ${authToken}`;
     }
@@ -130,9 +148,18 @@ export const createMetaMcpClient = (
     const hasHeaders = Object.keys(headers).length > 0;
 
     if (!hasHeaders) {
-      transport = new StreamableHTTPClientTransport(new URL(transformedUrl));
+      transport = new StreamableHTTPClientTransport(new URL(transformedUrl), {
+        fetch: createUpstreamFetch(
+          { ...serverParams, url: serverParams.url },
+          serverParams.oauth_user_id,
+        ),
+      });
     } else {
       transport = new StreamableHTTPClientTransport(new URL(transformedUrl), {
+        fetch: createUpstreamFetch(
+          { ...serverParams, url: serverParams.url },
+          serverParams.oauth_user_id,
+        ),
         requestInit: {
           headers,
         },
@@ -320,82 +347,11 @@ export const connectMetaMcpClient = async (
       const isHttpServer =
         serverParams.type === "SSE" || serverParams.type === "STREAMABLE_HTTP";
 
-      // Recovery cascade — ORDER IS LOAD-BEARING. Do not reorder without
-      // re-reading the rationale below.
-      //
-      //   refresh-on-401  →  post-auth race recovery  →  count++ / back-off
-      //
-      // Why this order:
-      //
-      //   - 401-refresh MUST run first. An expired access_token surfaces
-      //     as a 401 from the upstream during initialize; the refresh
-      //     helper rotates it server-side and `continue`s the outer
-      //     loop. The post-auth race branch's error matrix refuses 4xx
-      //     as a belt-and-braces second line of defence, but routing
-      //     401s through refresh-on-401 first is what actually fixes
-      //     the connection. If you swap the order, refresh stops
-      //     running and the connection just retries with the same dead
-      //     token until `maxAttempts` exhausts.
-      //
-      //   - Post-auth race recovery is second. It owns the narrow
-      //     symptom set (empty body / ECONNREFUSED / 5xx-with-empty-body)
-      //     that fires immediately after `exchangeToken` writes tokens.
-      //     The helper enforces a 10s window so chronically-broken
-      //     servers fall through to the outer back-off instead of
-      //     getting stuck in fast-retry loops.
-      //
-      //   - count++ / sleep(waitFor) is last. The 5s wait is too long
-      //     for the post-auth race (resolves in ~250ms) but is the
-      //     right cadence for anything else.
-      //
-      // 1. Refresh-on-401: if the upstream MCP server returned an
-      //    unauthorized response and we have a refresh_token on file, try
-      //    a server-to-server refresh once before counting this as a
-      //    retry. On success the next loop iteration rebuilds the
-      //    transport using the freshly-rotated access_token; on failure
-      //    we fall through.
-      if (
-        isHttpServer &&
-        serverParams.oauth_tokens?.refresh_token &&
-        isUpstreamUnauthorizedError(error)
-      ) {
-        try {
-          const refresh = await tryRefreshUpstreamTokens(serverParams);
-          if (refresh.status === "refreshed" && refresh.tokens) {
-            serverParams.oauth_tokens = {
-              access_token: refresh.tokens.access_token,
-              token_type: refresh.tokens.token_type,
-              expires_in: refresh.tokens.expires_in,
-              scope:
-                typeof refresh.tokens.scope === "string"
-                  ? refresh.tokens.scope
-                  : undefined,
-              refresh_token:
-                typeof refresh.tokens.refresh_token === "string"
-                  ? refresh.tokens.refresh_token
-                  : undefined,
-            };
-            logger.info(
-              `[oauth] upstream 401 refreshed for ${serverParams.name} (${serverParams.uuid}); retrying connect`,
-            );
-            // Refresh is the recovery, not a backoff-worthy failure.
-            continue;
-          }
-          logger.warn(
-            `[oauth] upstream 401 refresh did not recover ${serverParams.name} ` +
-              `(${serverParams.uuid}): ${refresh.status}${
-                refresh.error ? ` (${refresh.error})` : ""
-              }`,
-          );
-        } catch (refreshError) {
-          logger.error(
-            `[oauth] upstream 401 refresh threw for ${serverParams.name} (${serverParams.uuid}):`,
-            refreshError,
-          );
-        }
-      }
+      // The fetch wrapper already attempted one refresh. Stop on terminal
+      // authentication failures instead of refreshing indefinitely.
+      if (isHttpServer && isUpstreamUnauthorizedError(error)) return undefined;
 
-      // 2. Post-auth race recovery (issue #298): if tokens were issued
+      // Post-auth race recovery (issue #298): if tokens were issued
       //    recently AND the failure matches the empirical post-auth
       //    symptom set (empty body / ECONNREFUSED / 5xx-with-empty-body),
       //    the upstream is likely still wiring up its per-session state.
@@ -405,20 +361,13 @@ export const connectMetaMcpClient = async (
       //    here. The 401-refresh branch above runs first so a real auth
       //    failure (4xx) is not caught here — the helper itself also
       //    refuses 4xx-status errors as a second line of defence.
-      if (isHttpServer) {
+      if (isHttpServer && serverParams.oauth_user_id) {
         try {
           const session = await oauthSessionsRepository.findByMcpServerUuid(
             serverParams.uuid,
+            serverParams.oauth_user_id,
           );
-          // Approximation. `oauth_sessions.updated_at` is bumped by every
-          // write to the row — token upserts (the signal we care about),
-          // `state()` seeding `expected_state`, the post-success
-          // clearExpectedState, and code_verifier writes. After any of
-          // those, a network blip within 10s falsely triggers up to 3
-          // fast retries. Cost: ~1.75s of harmless backoff. The helper's
-          // narrow error matrix still refuses terminal failures, so the
-          // approximation cannot cause runaway retries on a real outage.
-          // A precise `tokens_issued_at` column would be a follow-up.
+          // The existing bounded post-auth retry uses the last scoped write.
           const tokensRecentlyTouchedAt =
             session?.tokens && session.updated_at
               ? new Date(session.updated_at)

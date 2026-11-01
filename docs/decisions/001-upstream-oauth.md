@@ -1,0 +1,19 @@
+# Backend-owned upstream MCP OAuth
+
+MetaMCP performs RFC 9728 protected-resource discovery, RFC 8414/OIDC authorization-server discovery, and RFC 7591 registration on the backend. The browser calls `frontend.oauth.begin`, navigates to the returned authorization URL, and relays the code/state callback. No upstream metadata, registration, token, or refresh requests run in the browser. No provider-specific code or CORS changes are needed.
+
+Discovery uses the resource's Bearer challenge, path-aware well-known URLs, and a separate issuer when advertised. Metadata is validated against its issuer and resource. Authorization and token requests include the resource indicator. PKCE uses S256; state has 256 bits of randomness, expires after ten minutes, and is consumed atomically before token exchange. A failed exchange requires starting again. Only one pending flow per user/server is supported; starting again supersedes the previous one.
+
+All OAuth procedures, including the admin MCP equivalents, authenticate the caller and check private-server ownership. Public server configurations permit each user to authorize independently. Sessions are keyed by `(user_id, mcp_server_uuid)`. Get responses contain connection status and an allowlist of non-secret client configuration. Browser upserts can configure a pre-registered client, but cannot write tokens, state, or PKCE. Omitting a secret while editing the same client preserves it; clearing/replacing the client removes its credentials.
+
+Tokens, client configuration (including secrets), and PKCE verifiers are encrypted with AES-256-GCM. A key derived from `BETTER_AUTH_SECRET` is domain-separated for upstream OAuth. Authenticated associated data binds ciphertext to user, MCP server, and field. The state column contains a SHA-256 digest. Stable secrets of at least 32 characters are required across instances; changing the secret invalidates encrypted upstream credentials and requires reauthorization.
+
+Discovery, registration and token requests require public HTTPS destinations without URL credentials/fragments. All DNS answers must be public; the HTTPS connection is pinned to a validated answer, while certificate validation still uses the original hostname. Redirects are rejected (including POST-preserving 307/308), JSON responses are bounded to 1 MiB, and OAuth requests time out after 15 seconds. OAuth-bearing MCP requests also use the pinned transport and cannot switch origins. Private-network OAuth destinations are intentionally unsupported; existing non-OAuth local/STDIO servers retain their transport behavior.
+
+The backend attaches access tokens and attempts one refresh on a 401. Streamable HTTP proxying preserves upstream status and `WWW-Authenticate` instead of wrapping the initial failure in JSON-RPC. Transport resumptions/deletes are bound to caller and endpoint. Connections with personal identity are never placed in the shared idle pool or reused at the connection cap. Anonymous public requests and background warmup do not load personal OAuth sessions. API-key/OAuth-authenticated endpoint calls use that credential's authenticated MetaMCP user, not the server/endpoint owner.
+
+Pre-registered clients remain supported when DCR is absent or rejected. Supplying both endpoints explicitly skips metadata discovery, but the same destination checks and PKCE still apply. Configuration is personal even on a public MCP server.
+
+Refresh deduplication remains in-process, now keyed by user and server. Multiple replicas may race rotating refresh tokens; deploy a single backend replica for upstream OAuth until distributed refresh serialization is implemented. No automatic deployment is included.
+
+Standards: [MCP authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization), [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728), [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414), [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591).

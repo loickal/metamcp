@@ -53,6 +53,7 @@ const OAuthCallback = () => {
       const code = params.get("code");
       const state = params.get("state") ?? undefined;
       const upstreamError = params.get("error");
+      window.history.replaceState({}, "", window.location.pathname);
       const upstreamErrorDescription =
         params.get("error_description") ?? undefined;
       const serverUrl = sessionStorage.getItem(SESSION_KEYS.SERVER_URL);
@@ -72,7 +73,7 @@ const OAuthCallback = () => {
         return;
       }
 
-      if (!code || !serverUrl || !mcpServerUuid) {
+      if (!code || !state || !serverUrl || !mcpServerUuid) {
         clearOAuthSessionKeys(serverUrl);
         setStatus({
           kind: "error",
@@ -84,17 +85,8 @@ const OAuthCallback = () => {
       }
 
       try {
-        // The browser-side SDK already ran discovery, registration (if
-        // needed), `saveCodeVerifier`, and the redirect to the upstream's
-        // authorize endpoint. The remaining step — POSTing the code to the
-        // upstream's token endpoint — moves to the backend because most
-        // enterprise providers (Salesforce, Okta, Auth0, ...) do not
-        // expose CORS-permissive token endpoints.
-        // Note: we deliberately do NOT pass serverUrl to the backend. The
-        // backend looks up the upstream URL from `mcp_servers` keyed by
-        // uuid; accepting it from the browser would let any authenticated
-        // user steer the server-side token POST at an attacker-controlled
-        // host (SSRF / authorization-code exfiltration).
+        // Discovery, registration and PKCE were completed on the backend.
+        // Only the callback code and state are relayed by the browser.
         const result =
           await vanillaTrpcClient.frontend.oauth.exchangeToken.mutate({
             mcp_server_uuid: mcpServerUuid,

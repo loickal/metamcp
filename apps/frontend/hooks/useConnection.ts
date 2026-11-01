@@ -1,4 +1,3 @@
-import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import {
   SSEClientTransport,
@@ -39,15 +38,13 @@ import { toast } from "sonner";
 import type * as z3 from "zod/v3";
 import type * as z4 from "zod/v4/core";
 
-import { SESSION_KEYS } from "@/lib/constants";
-
 import { ConnectionStatus } from "../lib/constants";
 import { getAppUrl } from "../lib/env";
 import {
   Notification,
   StdErrNotificationSchema,
 } from "../lib/notificationTypes";
-import { createAuthProvider } from "../lib/oauth-provider";
+import { beginOAuth } from "../lib/oauth-provider";
 import { trpc } from "../lib/trpc";
 
 // Mirror the MCP SDK's zod 3/4 compatibility types. SDK 1.26 result schemas use
@@ -102,7 +99,6 @@ export function useConnection({
   includeInactiveServers = false,
   enabled = true,
 }: UseConnectionOptions) {
-  const authProvider = createAuthProvider(mcpServerUuid, url);
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("disconnected");
   const [serverCapabilities, setServerCapabilities] =
@@ -312,14 +308,8 @@ export function useConnection({
   });
 
   const handleAuthError = useMemoizedFn(async (error: unknown) => {
-    if (is401Error(error)) {
-      sessionStorage.setItem(SESSION_KEYS.SERVER_URL, url || "");
-      sessionStorage.setItem(SESSION_KEYS.MCP_SERVER_UUID, mcpServerUuid);
-
-      const result = await auth(authProvider, {
-        serverUrl: url || "",
-      });
-      return result === "AUTHORIZED";
+    if (!isMetaMCP && is401Error(error)) {
+      await beginOAuth(mcpServerUuid, url);
     }
     return false;
   });
@@ -373,8 +363,7 @@ export function useConnection({
         const headers: HeadersInit = {};
 
         // Use manually provided bearer token if available, otherwise use OAuth tokens
-        const token =
-          bearerToken || (await authProvider.tokens())?.access_token;
+        const token = bearerToken;
         if (token) {
           const authHeaderName = headerName || "Authorization";
 
@@ -433,7 +422,6 @@ export function useConnection({
               mcpProxyServerUrl.searchParams.append("args", args);
               mcpProxyServerUrl.searchParams.append("env", JSON.stringify(env));
               transportOptions = {
-                authProvider: authProvider,
                 eventSourceInit: {
                   fetch: (
                     url: string | URL | globalThis.Request,
@@ -461,7 +449,10 @@ export function useConnection({
 
             case McpServerTypeEnum.enum.SSE:
               mcpProxyServerUrl = new URL(`/mcp-proxy/server/sse`, getAppUrl());
-              mcpProxyServerUrl.searchParams.append("url", url);
+              mcpProxyServerUrl.searchParams.append(
+                "mcpServerUuid",
+                mcpServerUuid,
+              );
               transportOptions = {
                 eventSourceInit: {
                   fetch: (
@@ -490,9 +481,11 @@ export function useConnection({
 
             case McpServerTypeEnum.enum.STREAMABLE_HTTP:
               mcpProxyServerUrl = new URL(`/mcp-proxy/server/mcp`, getAppUrl());
-              mcpProxyServerUrl.searchParams.append("url", url);
+              mcpProxyServerUrl.searchParams.append(
+                "mcpServerUuid",
+                mcpServerUuid,
+              );
               transportOptions = {
-                authProvider: authProvider,
                 eventSourceInit: {
                   fetch: (
                     url: string | URL | globalThis.Request,
@@ -645,7 +638,6 @@ export function useConnection({
       }
       if (enabled) {
         // Only clear auth provider if hook is enabled (to avoid clearing when just disabled)
-        authProvider.clear();
       }
     } catch (error) {
       console.error("Error during disconnect:", error);

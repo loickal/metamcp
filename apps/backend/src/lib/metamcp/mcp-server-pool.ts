@@ -149,7 +149,10 @@ export class McpServerPool {
     for (const [sessionId, sessionServers] of Object.entries(
       this.activeSessions,
     )) {
-      if (sessionServers[serverUuid]) {
+      if (
+        sessionServers[serverUuid] &&
+        !sessionServers[serverUuid].oauthUserId
+      ) {
         const timestamp = this.sessionTimestamps[sessionId] || Infinity;
         if (timestamp < oldestTimestamp) {
           oldestTimestamp = timestamp;
@@ -174,7 +177,7 @@ export class McpServerPool {
     namespaceUuid?: string,
   ): Promise<ConnectedClient | undefined> {
     // Update server params cache
-    this.serverParamsCache[serverUuid] = params;
+    if (!params.oauth_user_id) this.serverParamsCache[serverUuid] = params;
 
     // Check if we already have an active session for this sessionId and server
     if (this.activeSessions[sessionId]?.[serverUuid]) {
@@ -193,7 +196,7 @@ export class McpServerPool {
     // Check if we have an idle session for this server that we can convert.
     // Skip idle reuse for servers with forward_headers since each client may
     // need unique credentials forwarded to the backend MCP server.
-    if (!serverRequiresForwardedHeaders(params)) {
+    if (!params.oauth_user_id && !serverRequiresForwardedHeaders(params)) {
       const idleClient = this.idleSessions[serverUuid];
       if (idleClient) {
         // Convert idle session to active session
@@ -214,6 +217,8 @@ export class McpServerPool {
 
     // No idle session available — check per-server cap before spawning
     if (!this.canCreateConnectionForServer(serverUuid)) {
+      if (params.oauth_user_id || serverRequiresForwardedHeaders(params))
+        return undefined;
       // At cap: reuse the oldest active connection instead of spawning
       const reusable = this.findOldestActiveConnectionForServer(serverUuid);
       if (reusable) {
@@ -244,6 +249,7 @@ export class McpServerPool {
       return this.activeSessions[sessionId][serverUuid];
     }
 
+    newClient.oauthUserId = params.oauth_user_id;
     this.activeSessions[sessionId][serverUuid] = newClient;
     this.sessionToServers[sessionId].add(serverUuid);
 
@@ -254,7 +260,7 @@ export class McpServerPool {
     // Only pre-warm idle pool for servers that don't require forwarded headers.
     // Idle sessions are created without per-client headers, so they can't be
     // reused when per-client header forwarding is configured.
-    if (!serverRequiresForwardedHeaders(params)) {
+    if (!params.oauth_user_id && !serverRequiresForwardedHeaders(params)) {
       this.createIdleSessionAsync(serverUuid, params, namespaceUuid);
     }
 
@@ -336,6 +342,7 @@ export class McpServerPool {
     params: ServerParameters,
     namespaceUuid?: string,
   ): Promise<void> {
+    if (params.oauth_user_id) return;
     // Don't create if we already have an idle session or are already creating one.
     // Both checks are synchronous (before any await) so they act as a pre-await
     // mutex, matching the pattern used by createIdleSessionAsync.
@@ -400,6 +407,7 @@ export class McpServerPool {
     params: ServerParameters,
     namespaceUuid?: string,
   ): void {
+    if (params.oauth_user_id) return;
     // Don't create if we already have an idle session or are already creating one
     if (
       this.idleSessions[serverUuid] ||
@@ -502,7 +510,7 @@ export class McpServerPool {
 
     // Try to recycle each connection back to idle pool
     for (const [serverUuid, client] of Object.entries(activeSession)) {
-      if (!this.idleSessions[serverUuid]) {
+      if (!client.oauthUserId && !this.idleSessions[serverUuid]) {
         // No idle session for this server — recycle the connection
         this.idleSessions[serverUuid] = client;
         recycled++;
@@ -774,7 +782,7 @@ export class McpServerPool {
     logger.info(`Invalidating idle session for server ${serverUuid}`);
 
     // Update server params cache
-    this.serverParamsCache[serverUuid] = params;
+    if (!params.oauth_user_id) this.serverParamsCache[serverUuid] = params;
 
     // Cleanup existing idle session if it exists
     const existingIdleSession = this.idleSessions[serverUuid];
@@ -865,7 +873,7 @@ export class McpServerPool {
     logger.info(`Ensuring idle session exists for new server ${serverUuid}`);
 
     // Update server params cache
-    this.serverParamsCache[serverUuid] = params;
+    if (!params.oauth_user_id) this.serverParamsCache[serverUuid] = params;
 
     // Only create if we don't already have one
     if (

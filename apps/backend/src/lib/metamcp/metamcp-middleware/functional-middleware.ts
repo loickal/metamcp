@@ -17,6 +17,7 @@ export interface MetaMCPHandlerContext {
     apiKeyUuid?: string;
     apiKeyUserId?: string;
     oauthUserId?: string;
+    sessionUserId?: string;
   };
 }
 

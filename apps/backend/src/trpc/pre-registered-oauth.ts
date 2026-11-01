@@ -1,6 +1,6 @@
-import { OAuthClientInformation } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { OAuthClientInfoRequest } from "@repo/zod-types";
 
+import { validateOAuthUrl } from "../lib/oauth-upstream/safe-fetch";
 import type { OAuthSessionsRepository } from "../db/repositories/oauth-sessions.repo";
 
 // Build the full `oauth_sessions.client_information` jsonb from
@@ -60,6 +60,8 @@ export async function persistPreRegisteredOAuthClient(
   mcpServerUuid: string,
   oauth: OAuthClientInfoRequest,
   repo: OAuthSessionsRepository,
+  userId: string,
+  serverUrl: string,
 ): Promise<void> {
   const clientInfo = buildPreRegisteredClientInformation(
     oauth,
@@ -70,18 +72,36 @@ export async function persistPreRegisteredOAuthClient(
   // Drop any pre-registered session so the SDK falls back to dynamic
   // registration on the next authorize attempt.
   if (!clientInfo) {
-    const existing = await repo.findByMcpServerUuid(mcpServerUuid);
+    const existing = await repo.findByMcpServerUuid(mcpServerUuid, userId);
     if (existing) {
-      await repo.deleteByMcpServerUuid(mcpServerUuid);
+      await repo.deleteByMcpServerUuid(mcpServerUuid, userId);
     }
     return;
   }
 
+  for (const field of ["authorization_endpoint", "token_endpoint"]) {
+    if (typeof clientInfo[field] === "string")
+      await validateOAuthUrl(clientInfo[field]);
+  }
+  const existing = await repo.findByMcpServerUuid(mcpServerUuid, userId);
+  if (
+    !clientInfo.client_secret &&
+    existing?.client_information?.client_id === clientInfo.client_id
+  ) {
+    clientInfo.client_secret = existing?.client_information?.client_secret;
+  }
   await repo.upsert({
     mcp_server_uuid: mcpServerUuid,
-    // The repo type narrows `client_information` to the MCP SDK's 4-field
-    // OAuthClientInformation. The underlying jsonb column accepts the full
-    // RFC 7591 shape we want to round-trip, so we widen via an explicit cast.
-    client_information: clientInfo as unknown as OAuthClientInformation,
+    user_id: userId,
+    client_information: {
+      ...clientInfo,
+      client_id: clientInfo.client_id as string,
+      pre_registered: true,
+      server_url: serverUrl,
+    },
+    tokens: null,
+    code_verifier: null,
+    expected_state: null,
+    flow_expires_at: null,
   });
 }

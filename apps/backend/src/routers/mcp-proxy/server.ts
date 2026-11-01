@@ -1,13 +1,9 @@
-import { randomUUID } from "node:crypto";
-
 import {
   SSEClientTransport,
   SseError,
 } from "@modelcontextprotocol/sdk/client/sse.js";
 import { getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { McpServerErrorStatusEnum, McpServerTypeEnum } from "@repo/zod-types";
 import express from "express";
@@ -18,7 +14,9 @@ import logger from "@/utils/logger";
 
 import { mcpServersRepository } from "../../db/repositories";
 import mcpProxy from "../../lib/mcp-proxy";
-import { transformDockerUrl } from "../../lib/metamcp/client";
+import { requireOAuthServer } from "../../lib/oauth-upstream/access";
+import { createUpstreamFetch } from "../../lib/oauth-upstream/upstream-fetch";
+import { upstreamHttpRouter } from "./upstream-http";
 import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
 import { resolveEnvVariables } from "../../lib/metamcp/utils";
 import { ProcessManagedStdioTransport } from "../../lib/stdio-transport/process-managed-transport";
@@ -191,13 +189,25 @@ const serverRouter = express.Router();
 
 // Apply better auth middleware to all MCP proxy routes
 serverRouter.use(betterAuthMcpMiddleware);
+serverRouter.use(upstreamHttpRouter);
 
 const webAppTransports: Map<string, Transport> = new Map<string, Transport>(); // Web app transports by web app sessionId
+const sessionOwners = new Map<string, string>();
+serverRouter.use((req, res, next) => {
+  const sessionId = req.query.sessionId as string | undefined;
+  const userId = (req as express.Request & { user?: { id: string } }).user?.id;
+  if (sessionId && sessionOwners.get(sessionId) !== userId) {
+    res.status(404).end("Session not found");
+    return;
+  }
+  next();
+});
 const serverTransports: Map<string, Transport> = new Map<string, Transport>(); // Server Transports by web app sessionId
 
 // Session cleanup function
 const cleanupSession = async (sessionId: string) => {
   logger.info(`Cleaning up proxy session ${sessionId}`);
+  sessionOwners.delete(sessionId);
 
   // Clean up web app transport
   const webAppTransport = webAppTransports.get(sessionId);
@@ -232,7 +242,6 @@ const cleanupSession = async (sessionId: string) => {
 
 const createTransport = async (req: express.Request): Promise<Transport> => {
   const query = req.query;
-  logger.info("Query parameters:", JSON.stringify(query));
 
   const transportType = query.transportType as string;
 
@@ -293,258 +302,47 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
       throw error;
     }
   } else if (transportType === McpServerTypeEnum.enum.SSE) {
-    const url = transformDockerUrl(query.url as string);
-
-    // Check if the server is in error state (for SSE, we need to find server by URL)
-    const servers = await mcpServersRepository.findAll();
-    const matchingServer = servers.find(
-      (server) => server.type === "SSE" && server.url === url,
+    const userId =
+      (req as express.Request & { user?: { id: string } }).user?.id ?? "";
+    const server = await requireOAuthServer(
+      String(query.mcpServerUuid ?? ""),
+      userId,
     );
-    if (matchingServer) {
-      const isInError = await checkServerErrorStatus(matchingServer.uuid);
-      if (isInError) {
-        throw new Error(
-          `Server is in error state and cannot be connected to. Please check the server configuration and try again later.`,
-        );
-      }
-    }
-
-    // Merge custom headers from database with passthrough headers from request
+    if (server.type !== "SSE") throw new Error("Invalid transport type");
     const headers = {
-      ...(matchingServer?.headers || {}),
       ...getHttpHeaders(req, transportType),
+      ...(server.headers ?? {}),
     };
-
-    logger.info(
-      `SSE transport: url=${url}, headers=${JSON.stringify(headers)}`,
-    );
-
-    const transport = new SSEClientTransport(new URL(url), {
+    if (server.bearerToken)
+      headers.Authorization = `Bearer ${server.bearerToken}`;
+    const upstreamFetch = createUpstreamFetch(server, userId);
+    let challenge: string | null | undefined;
+    const transport = new SSEClientTransport(new URL(server.url), {
+      fetch: upstreamFetch,
       eventSourceInit: {
-        fetch: (url, init) => fetch(url, { ...init, headers }),
+        fetch: async (url, init) => {
+          const response = await upstreamFetch(url, { ...init, headers });
+          if (response.status === 401)
+            challenge = response.headers.get("www-authenticate") ?? "Bearer";
+          return response;
+        },
       },
-      requestInit: {
-        headers,
-      },
+      requestInit: { headers },
     });
-    await transport.start();
-    return transport;
-  } else if (transportType === McpServerTypeEnum.enum.STREAMABLE_HTTP) {
-    const url = transformDockerUrl(query.url as string);
-
-    // Check if the server is in error state (for STREAMABLE_HTTP, we need to find server by URL)
-    const servers = await mcpServersRepository.findAll();
-    const matchingServer = servers.find(
-      (server) => server.type === "STREAMABLE_HTTP" && server.url === url,
-    );
-    if (matchingServer) {
-      const isInError = await checkServerErrorStatus(matchingServer.uuid);
-      if (isInError) {
-        throw new Error(
-          `Server is in error state and cannot be connected to. Please check the server configuration and try again later.`,
-        );
-      }
+    try {
+      await transport.start();
+    } catch (error) {
+      await transport.close();
+      if (challenge && error instanceof Error)
+        Object.assign(error, { challenge });
+      throw error;
     }
-
-    // Merge custom headers from database with passthrough headers from request
-    const headers = {
-      ...(matchingServer?.headers || {}),
-      ...getHttpHeaders(req, transportType),
-    };
-
-    const transport = new StreamableHTTPClientTransport(new URL(url), {
-      requestInit: {
-        headers,
-      },
-    });
-    await transport.start();
     return transport;
   } else {
     logger.error(`Invalid transport type: ${transportType}`);
     throw new Error("Invalid transport type specified");
   }
 };
-
-serverRouter.get("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string;
-  // logger.info(`Received GET message for sessionId ${sessionId}`);
-  try {
-    const transport = webAppTransports.get(
-      sessionId,
-    ) as StreamableHTTPServerTransport;
-    if (!transport) {
-      res.status(404).end("Session not found");
-      return;
-    } else {
-      await transport.handleRequest(req, res);
-    }
-  } catch (error) {
-    logger.error("Error in /mcp route:", error);
-    res.status(500).json(error);
-  }
-});
-
-serverRouter.post("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  let serverTransport: Transport | undefined;
-  if (!sessionId) {
-    try {
-      logger.info("New StreamableHttp connection request");
-      try {
-        serverTransport = await createTransport(req);
-      } catch (error) {
-        if (error instanceof SseError && error.code === 401) {
-          logger.error(
-            "Received 401 Unauthorized from MCP server:",
-            error.message,
-          );
-          res.status(401).json(error);
-          return;
-        }
-
-        throw error;
-      }
-
-      logger.info("Created StreamableHttp server transport");
-
-      // Set up crash detection for STDIO transports in StreamableHttp route
-      if (serverTransport instanceof ProcessManagedStdioTransport) {
-        serverTransport.onprocesscrash = async (exitCode, signal) => {
-          logger.warn(
-            `StreamableHttp STDIO process crashed with code: ${exitCode}, signal: ${signal}`,
-          );
-
-          // Try to extract server UUID from the command/args
-          const query = req.query;
-          const command = query.command as string;
-          const origArgs = shellParseArgs(query.args as string) as string[];
-
-          const serverUuid = await extractServerUuidFromStdioCommand(
-            command,
-            origArgs,
-          );
-
-          if (serverUuid) {
-            // Report crash to server pool
-            mcpServerPool
-              .handleServerCrashWithoutNamespace(serverUuid, exitCode, signal)
-              .catch((error) => {
-                logger.error(
-                  `Error reporting StreamableHttp STDIO crash to server pool for ${serverUuid}:`,
-                  error,
-                );
-              });
-          } else {
-            logger.warn(
-              `Could not determine server UUID for crashed StreamableHttp STDIO process: ${command} ${origArgs.join(" ")}`,
-            );
-          }
-        };
-      }
-
-      // Generate session ID upfront for better tracking
-      const newSessionId = randomUUID();
-
-      const webAppTransport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => newSessionId,
-        onsessioninitialized: (sessionId) => {
-          webAppTransports.set(sessionId, webAppTransport);
-          if (serverTransport) {
-            serverTransports.set(sessionId, serverTransport);
-          }
-          logger.info("Client <-> Proxy  sessionId: " + sessionId);
-        },
-      });
-      logger.info("Created StreamableHttp client transport");
-
-      await webAppTransport.start();
-
-      // Set up proxy connection with error handling
-      try {
-        mcpProxy({
-          transportToClient: webAppTransport,
-          transportToServer: serverTransport,
-          onCleanup: async () => {
-            await cleanupSession(newSessionId);
-          },
-        });
-      } catch (error) {
-        logger.error(
-          `Error setting up proxy for session ${newSessionId}:`,
-          error,
-        );
-        await cleanupSession(newSessionId);
-        throw error;
-      }
-
-      // Handle the actual request - don't pass req.body since it wasn't parsed
-      await (webAppTransport as StreamableHTTPServerTransport).handleRequest(
-        req,
-        res,
-      );
-    } catch (error) {
-      logger.error("Error in /mcp POST route:", error);
-      res.status(500).json(error);
-    }
-  } else {
-    // logger.info(`Received POST message for sessionId ${sessionId}`);
-    try {
-      const transport = webAppTransports.get(
-        sessionId,
-      ) as StreamableHTTPServerTransport;
-      if (!transport) {
-        res.status(404).end("Transport not found for sessionId " + sessionId);
-      } else {
-        await (transport as StreamableHTTPServerTransport).handleRequest(
-          req,
-          res,
-        );
-      }
-    } catch (error) {
-      logger.error("Error in /mcp route:", error);
-      res.status(500).json(error);
-    }
-  }
-});
-
-serverRouter.delete("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  const mcpServerName = (req.query.mcpServerName as string) || "Unknown Server";
-  logger.info(
-    `Received DELETE message for sessionId ${sessionId}, MCP server: ${mcpServerName}`,
-  );
-
-  if (sessionId) {
-    try {
-      const serverTransport = serverTransports.get(
-        sessionId,
-      ) as StreamableHTTPClientTransport;
-      if (!serverTransport) {
-        res.status(404).end("Transport not found for sessionId " + sessionId);
-        return;
-      }
-
-      // Terminate the session and clean up
-      try {
-        await serverTransport.terminateSession();
-      } catch (error) {
-        logger.warn(`Warning: Error terminating session ${sessionId}:`, error);
-        // Continue with cleanup even if termination fails
-      }
-
-      await cleanupSession(sessionId);
-      logger.info(
-        `Session ${sessionId} terminated and cleaned up successfully`,
-      );
-      res.status(200).end();
-    } catch (error) {
-      logger.error("Error in /mcp DELETE route:", error);
-      res.status(500).json(error);
-    }
-  } else {
-    res.status(400).end("Missing sessionId");
-  }
-});
 
 serverRouter.get("/stdio", async (req, res) => {
   try {
@@ -558,7 +356,13 @@ serverRouter.get("/stdio", async (req, res) => {
         logger.error(
           "Received 401 Unauthorized from MCP server. Authentication failure.",
         );
-        res.status(401).json(error);
+        res.setHeader(
+          "WWW-Authenticate",
+          (error as SseError & { challenge?: string }).challenge ?? "Bearer",
+        );
+        res
+          .status(401)
+          .json({ error: "Upstream OAuth authorization required" });
         return;
       }
 
@@ -572,6 +376,10 @@ serverRouter.get("/stdio", async (req, res) => {
     logger.info("Created client transport");
 
     webAppTransports.set(webAppTransport.sessionId, webAppTransport);
+    sessionOwners.set(
+      webAppTransport.sessionId,
+      (req as express.Request & { user: { id: string } }).user.id,
+    );
     serverTransports.set(webAppTransport.sessionId, serverTransport);
 
     // Handle cleanup when connection closes
@@ -754,7 +562,13 @@ serverRouter.get("/sse", async (req, res) => {
         logger.error(
           "Received 401 Unauthorized from MCP server. Authentication failure.",
         );
-        res.status(401).json(error);
+        res.setHeader(
+          "WWW-Authenticate",
+          (error as SseError & { challenge?: string }).challenge ?? "Bearer",
+        );
+        res
+          .status(401)
+          .json({ error: "Upstream OAuth authorization required" });
         return;
       } else if (error instanceof SseError && error.code === 404) {
         logger.error(
@@ -776,6 +590,10 @@ serverRouter.get("/sse", async (req, res) => {
         res,
       );
       webAppTransports.set(webAppTransport.sessionId, webAppTransport);
+      sessionOwners.set(
+        webAppTransport.sessionId,
+        (req as express.Request & { user: { id: string } }).user.id,
+      );
       logger.info("Created client transport");
       if (serverTransport) {
         serverTransports.set(webAppTransport.sessionId, serverTransport);

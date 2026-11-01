@@ -118,6 +118,10 @@ export const createServer = async (
   clientRequestHeaders?: Record<string, string>,
   requestContext?: Pick<MetaMCPHandlerContext, "endpointName" | "auth">,
 ) => {
+  const oauthUserId =
+    requestContext?.auth?.sessionUserId ??
+    requestContext?.auth?.oauthUserId ??
+    requestContext?.auth?.apiKeyUserId;
   const toolToClient: Record<string, ConnectedClient> = {};
   const toolToServerUuid: Record<string, string> = {};
   const promptToClient: Record<string, ConnectedClient> = {};
@@ -182,6 +186,7 @@ export const createServer = async (
     const serverParams = await getMcpServers(
       context.namespaceUuid,
       includeInactiveServers,
+      oauthUserId,
     );
 
     // Extract forwarded headers from client request for servers that need them
@@ -457,6 +462,7 @@ export const createServer = async (
         const serverParams = await getMcpServers(
           namespaceUuid,
           includeInactiveServers,
+          oauthUserId,
         );
 
         // Extract forwarded headers for dynamic tool routing
@@ -604,6 +610,7 @@ export const createServer = async (
       const serverParamsMap = await getMcpServers(
         namespaceUuid,
         includeInactiveServers,
+        oauthUserId,
       );
       const params = serverParamsMap[serverUuid];
       if (!params) {
@@ -741,6 +748,7 @@ export const createServer = async (
     const serverParams = await getMcpServers(
       namespaceUuid,
       includeInactiveServers,
+      oauthUserId,
     );
     const allPrompts: ListPromptsResult["prompts"] = [];
     const failedServers: string[] = [];
@@ -889,6 +897,7 @@ export const createServer = async (
     const serverParams = await getMcpServers(
       namespaceUuid,
       includeInactiveServers,
+      oauthUserId,
     );
     const allResources: ListResourcesResult["resources"] = [];
     const failedServers: string[] = [];
@@ -1068,6 +1077,7 @@ export const createServer = async (
       const serverParams = await getMcpServers(
         namespaceUuid,
         includeInactiveServers,
+        oauthUserId,
       );
       const allTemplates: ResourceTemplate[] = [];
       const failedServers: string[] = [];
