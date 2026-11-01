@@ -121,12 +121,13 @@ export const oauthImplementations = {
       const metadata = discovery?.metadata;
       if (ci && !ci.pre_registered && ci.issuer !== metadata?.issuer) ci = null;
       const authorizationEndpoint = configured
-        ? (ci!.authorization_endpoint as string)
-        : metadata!.authorization_endpoint;
+        ? (ci?.authorization_endpoint as string)
+        : metadata?.authorization_endpoint;
       const tokenEndpoint = configured
-        ? (ci!.token_endpoint as string)
-        : metadata!.token_endpoint;
-      if (!tokenEndpoint) throw new Error("Missing token endpoint");
+        ? (ci?.token_endpoint as string)
+        : metadata?.token_endpoint;
+      if (!authorizationEndpoint || !tokenEndpoint)
+        throw new Error("Missing OAuth endpoints");
       await validateOAuthUrl(server.url);
       await validateOAuthUrl(authorizationEndpoint);
       await validateOAuthUrl(tokenEndpoint);
@@ -141,6 +142,17 @@ export const oauthImplementations = {
               "This OAuth server requires a pre-registered client. Configure its client ID in Advanced OAuth.",
           });
         }
+        const supportedMethods =
+          metadata.token_endpoint_auth_methods_supported ?? [
+            "client_secret_basic",
+          ];
+        const registrationMethod = [
+          "none",
+          "client_secret_basic",
+          "client_secret_post",
+        ].find((method) => supportedMethods.includes(method));
+        if (!registrationMethod)
+          throw new Error("Unsupported token endpoint authentication");
         const response = await safeOAuthFetch(metadata.registration_endpoint, {
           method: "POST",
           headers: {
@@ -150,7 +162,7 @@ export const oauthImplementations = {
           body: JSON.stringify({
             client_name: "MetaMCP",
             redirect_uris: [redirectUri],
-            token_endpoint_auth_method: "none",
+            token_endpoint_auth_method: registrationMethod,
             grant_types: ["authorization_code", "refresh_token"],
             response_types: ["code"],
             ...(scope && { scope }),
@@ -167,7 +179,16 @@ export const oauthImplementations = {
         const registered = OAuthClientInformationFullSchema.parse(
           await readOAuthJson(response),
         );
-        ci = registered;
+        const authMethod =
+          registered.token_endpoint_auth_method ?? registrationMethod;
+        if (
+          !["none", "client_secret_basic", "client_secret_post"].includes(
+            authMethod,
+          ) ||
+          (authMethod !== "none" && !registered.client_secret)
+        )
+          throw new Error("Invalid registered authentication method");
+        ci = { ...registered, token_endpoint_auth_method: authMethod };
         if (!registered.redirect_uris.includes(redirectUri))
           throw new Error("Registration redirect mismatch");
       }

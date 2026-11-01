@@ -1,4 +1,3 @@
-import { createSessionAccess } from "../../lib/oauth-upstream/session-access";
 import { randomUUID } from "node:crypto";
 
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -16,6 +15,7 @@ import { buildAdminToolsOptions } from "../../lib/admin-mcp/build-admin-tools-op
 import { extractClientHeaders } from "../../lib/metamcp/header-forwarding";
 import { MetaMCPHandlerContext } from "../../lib/metamcp/metamcp-middleware/functional-middleware";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
+import { createSessionAccess } from "../../lib/oauth-upstream/session-access";
 import { SessionLifetimeManagerImpl } from "../../lib/session-lifetime-manager";
 
 const streamableHttpRouter = express.Router();

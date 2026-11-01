@@ -1,4 +1,3 @@
-import { createSessionAccess } from "../../lib/oauth-upstream/session-access";
 import { randomUUID } from "node:crypto";
 
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
@@ -10,6 +9,7 @@ import logger from "@/utils/logger";
 
 import { createServer } from "../../lib/metamcp/index";
 import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
+import { createSessionAccess } from "../../lib/oauth-upstream/session-access";
 import { betterAuthMcpMiddleware } from "../../middleware/better-auth-mcp.middleware";
 
 const metamcpRouter = express.Router();

@@ -24,6 +24,8 @@ vi.mock("../lib/oauth-upstream/safe-fetch", () => ({
   readOAuthJson: (r: Response) => r.json(),
 }));
 
+import { createOAuthRouter } from "@repo/trpc";
+
 import {
   mcpServersRepository,
   oauthSessionsRepository as repo,
@@ -31,7 +33,6 @@ import {
 import { discoverUpstreamOAuth } from "../lib/oauth-upstream/discovery";
 import { safeOAuthFetch } from "../lib/oauth-upstream/safe-fetch";
 import { oauthImplementations as oauth } from "./oauth.impl";
-import { createOAuthRouter } from "../../../../packages/trpc/src/routers/frontend/oauth";
 
 const uuid = "00000000-0000-4000-8000-000000000001";
 const serverUrl = "https://resource.example/api/v4/mcp";
@@ -67,6 +68,7 @@ const metadata = {
   registration_endpoint: "https://issuer.example/register",
   response_types_supported: ["code"],
   code_challenge_methods_supported: ["S256"],
+  token_endpoint_auth_methods_supported: ["none"],
 };
 
 beforeEach(() => {
@@ -181,19 +183,59 @@ describe("backend authorization flow", () => {
       metadata.registration_endpoint,
       expect.objectContaining({ method: "POST" }),
     );
-    const saved = vi.mocked(repo.upsert).mock.calls[0]![0];
+    const saved = vi.mocked(repo.upsert).mock.calls[0]?.[0];
+    if (!saved?.code_verifier || !saved.flow_expires_at)
+      throw new Error("Missing persisted flow");
     const url = new URL(result.authorization_url);
     expect(url.origin).toBe("https://issuer.example");
     expect(url.searchParams.get("code_challenge")).toBe(
-      createHash("sha256").update(saved.code_verifier!).digest("base64url"),
+      createHash("sha256").update(saved.code_verifier).digest("base64url"),
     );
     expect(url.searchParams.get("state")).toBe(saved.expected_state);
     expect(url.searchParams.get("resource")).toBe(serverUrl);
     expect(url.searchParams.get("scope")).toBe("mcp");
     expect(saved.user_id).toBe("alice");
-    expect(saved.flow_expires_at!.getTime()).toBeGreaterThan(Date.now());
+    expect(saved.flow_expires_at.getTime()).toBeGreaterThan(Date.now());
     expect(Object.keys(result)).toEqual(["authorization_url"]);
   });
+
+  it.each(["client_secret_basic", "client_secret_post"])(
+    "negotiates DCR authentication method %s",
+    async (method) => {
+      vi.mocked(repo.findByMcpServerUuid).mockResolvedValue(undefined);
+      vi.mocked(discoverUpstreamOAuth).mockResolvedValue({
+        metadata: {
+          ...metadata,
+          token_endpoint_auth_methods_supported: [method],
+        },
+        resource: serverUrl,
+        scope: undefined,
+      });
+      vi.mocked(safeOAuthFetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            client_id: "confidential",
+            client_secret: "secret",
+            token_endpoint_auth_method: method,
+            redirect_uris: ["https://metamcp.example/fe-oauth/callback"],
+          }),
+        ),
+      );
+      await oauth.begin(input, "alice");
+      const body = JSON.parse(
+        String(vi.mocked(safeOAuthFetch).mock.calls[0]?.[1]?.body),
+      );
+      expect(body.token_endpoint_auth_method).toBe(method);
+      expect(repo.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          client_information: expect.objectContaining({
+            token_endpoint_auth_method: method,
+            client_secret: "secret",
+          }),
+        }),
+      );
+    },
+  );
 
   it("supports pre-registered clients without DCR and preserves their secret on edits", async () => {
     vi.mocked(repo.findByMcpServerUuid).mockResolvedValue({

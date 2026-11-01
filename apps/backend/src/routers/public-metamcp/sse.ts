@@ -1,4 +1,3 @@
-import { createSessionAccess } from "../../lib/oauth-upstream/session-access";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import express from "express";
@@ -15,6 +14,7 @@ import { buildAdminToolsOptions } from "../../lib/admin-mcp/build-admin-tools-op
 import { extractClientHeaders } from "../../lib/metamcp/header-forwarding";
 import { MetaMCPHandlerContext } from "../../lib/metamcp/metamcp-middleware/functional-middleware";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
+import { createSessionAccess } from "../../lib/oauth-upstream/session-access";
 import { SessionLifetimeManagerImpl } from "../../lib/session-lifetime-manager";
 
 const sseRouter = express.Router();

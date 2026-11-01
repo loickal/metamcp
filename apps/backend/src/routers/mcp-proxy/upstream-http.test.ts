@@ -83,8 +83,9 @@ describe("HTTP MCP proxy", () => {
     expect(createUpstreamFetch).toHaveBeenCalledWith(
       expect.objectContaining({ uuid }),
       "alice",
+      "https://upstream.example/mcp",
     );
-    expect((await result.json()).error).toBe("unauthorized");
+    expect(await result.json()).toMatchObject({ error: "unauthorized" });
   });
   it("keeps upstream session IDs private and rejects cross-user resumption/deletion", async () => {
     upstream.mockImplementation(
@@ -95,7 +96,8 @@ describe("HTTP MCP proxy", () => {
     );
     const connected = await post();
     await connected.text();
-    const id = connected.headers.get("mcp-session-id")!;
+    const id = connected.headers.get("mcp-session-id");
+    if (!id) throw new Error("Missing session ID");
     expect(id).toBeTruthy();
     expect(id).not.toBe("UPSTREAM_PRIVATE_SESSION");
     expect((await post("bob", id)).status).toBe(404);
@@ -111,7 +113,7 @@ describe("HTTP MCP proxy", () => {
     const resumed = await post("alice", id);
     await resumed.text();
     expect(
-      new Headers(upstream.mock.calls[1]![1]!.headers).get("mcp-session-id"),
+      new Headers(upstream.mock.calls[1]?.[1]?.headers).get("mcp-session-id"),
     ).toBe("UPSTREAM_PRIVATE_SESSION");
   });
   it("preserves non-OAuth streaming responses and rejects anonymous proxy requests", async () => {

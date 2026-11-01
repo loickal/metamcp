@@ -14,6 +14,7 @@ import { createUpstreamFetch } from "../oauth-upstream/upstream-fetch";
 import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
 import { metamcpLogStore } from "./log-store";
 import { serverErrorTracker } from "./server-error-tracker";
+import { transformDockerUrl } from "./transport-url";
 import { resolveEnvVariables } from "./utils";
 
 const sleep = (time: number) =>
@@ -26,19 +27,7 @@ export interface ConnectedClient {
   onProcessCrash?: (exitCode: number | null, signal: string | null) => void;
 }
 
-/**
- * Transforms localhost URLs to use host.docker.internal when running inside Docker
- */
-export const transformDockerUrl = (url: string): string => {
-  if (process.env.TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL === "true") {
-    const transformed = url.replace(
-      /localhost|127\.0\.0\.1/g,
-      "host.docker.internal",
-    );
-    return transformed;
-  }
-  return url;
-};
+export { transformDockerUrl } from "./transport-url";
 
 export const createMetaMcpClient = (
   serverParams: ServerParameters,
@@ -85,6 +74,11 @@ export const createMetaMcpClient = (
   } else if (serverParams.type === "SSE" && serverParams.url) {
     // Transform the URL if TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL is set to "true"
     const transformedUrl = transformDockerUrl(serverParams.url);
+    const upstreamFetch = createUpstreamFetch(
+      { ...serverParams, url: serverParams.url },
+      serverParams.oauth_user_id,
+      transformedUrl,
+    );
 
     // Build headers: start with custom headers, then add auth header
     const headers: Record<string, string> = {
@@ -101,38 +95,30 @@ export const createMetaMcpClient = (
 
     if (!hasHeaders) {
       transport = new SSEClientTransport(new URL(transformedUrl), {
-        fetch: createUpstreamFetch(
-          { ...serverParams, url: serverParams.url },
-          serverParams.oauth_user_id,
-        ),
+        fetch: upstreamFetch,
         eventSourceInit: {
-          fetch: createUpstreamFetch(
-            { ...serverParams, url: serverParams.url },
-            serverParams.oauth_user_id,
-          ),
+          fetch: upstreamFetch,
         },
       });
     } else {
       transport = new SSEClientTransport(new URL(transformedUrl), {
-        fetch: createUpstreamFetch(
-          { ...serverParams, url: serverParams.url },
-          serverParams.oauth_user_id,
-        ),
+        fetch: upstreamFetch,
         requestInit: {
           headers,
         },
         eventSourceInit: {
-          fetch: (url, init) =>
-            createUpstreamFetch(
-              { ...serverParams, url: serverParams.url! },
-              serverParams.oauth_user_id,
-            )(url, { ...init, headers }),
+          fetch: (url, init) => upstreamFetch(url, { ...init, headers }),
         },
       });
     }
   } else if (serverParams.type === "STREAMABLE_HTTP" && serverParams.url) {
     // Transform the URL if TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL is set to "true"
     const transformedUrl = transformDockerUrl(serverParams.url);
+    const upstreamFetch = createUpstreamFetch(
+      { ...serverParams, url: serverParams.url },
+      serverParams.oauth_user_id,
+      transformedUrl,
+    );
 
     // Build headers: start with custom headers, then add auth header
     const headers: Record<string, string> = {
@@ -149,17 +135,11 @@ export const createMetaMcpClient = (
 
     if (!hasHeaders) {
       transport = new StreamableHTTPClientTransport(new URL(transformedUrl), {
-        fetch: createUpstreamFetch(
-          { ...serverParams, url: serverParams.url },
-          serverParams.oauth_user_id,
-        ),
+        fetch: upstreamFetch,
       });
     } else {
       transport = new StreamableHTTPClientTransport(new URL(transformedUrl), {
-        fetch: createUpstreamFetch(
-          { ...serverParams, url: serverParams.url },
-          serverParams.oauth_user_id,
-        ),
+        fetch: upstreamFetch,
         requestInit: {
           headers,
         },

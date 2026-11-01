@@ -7,12 +7,13 @@ import { safeOAuthFetch } from "./safe-fetch";
 export function createUpstreamFetch(
   server: { uuid: string; name: string; url: string },
   userId?: string,
+  transportUrl = server.url,
 ): typeof fetch {
   return async (input, init = {}) => {
     const url = new URL(
       input instanceof Request ? input.url : input.toString(),
     );
-    if (url.origin !== new URL(server.url).origin)
+    if (url.origin !== new URL(transportUrl).origin)
       throw new Error("Cross-origin MCP transport destination rejected");
     const session = userId
       ? await oauthSessionsRepository.findByMcpServerUuid(server.uuid, userId)
@@ -21,6 +22,8 @@ export function createUpstreamFetch(
       session?.client_information?.server_url === server.url
         ? session.tokens
         : null;
+    if (tokens && url.origin !== new URL(server.url).origin)
+      throw new Error("OAuth credentials cannot use a transformed origin");
     const headers = new Headers(init.headers);
     if (tokens?.access_token)
       headers.set("Authorization", `Bearer ${tokens.access_token}`);

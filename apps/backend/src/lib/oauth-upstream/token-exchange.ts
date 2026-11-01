@@ -11,7 +11,7 @@
 // is known ahead of time (either from pre-registered client_information or
 // from discovery against the protected resource).
 
-import { safeOAuthFetch, readOAuthJson } from "./safe-fetch";
+import { readOAuthJson, safeOAuthFetch } from "./safe-fetch";
 
 export type TokenEndpointAuthMethod =
   | "none"

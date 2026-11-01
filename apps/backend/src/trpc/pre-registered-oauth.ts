@@ -1,7 +1,7 @@
 import { OAuthClientInfoRequest } from "@repo/zod-types";
 
-import { validateOAuthUrl } from "../lib/oauth-upstream/safe-fetch";
 import type { OAuthSessionsRepository } from "../db/repositories/oauth-sessions.repo";
+import { validateOAuthUrl } from "../lib/oauth-upstream/safe-fetch";
 
 // Build the full `oauth_sessions.client_information` jsonb from
 // user-supplied pre-registration fields. `redirect_uris` is derived

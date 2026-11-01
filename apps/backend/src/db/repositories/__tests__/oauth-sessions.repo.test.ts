@@ -27,7 +27,8 @@ describe.skipIf(!url)("user-scoped OAuth repository (PostgreSQL)", () => {
   >;
   const server = "00000000-0000-0000-0000-000000000001";
   beforeAll(async () => {
-    const target = new URL(url!);
+    if (!url) throw new Error("TEST_DATABASE_URL is required");
+    const target = new URL(url);
     if (
       !["localhost", "127.0.0.1"].includes(target.hostname) ||
       !target.pathname.endsWith("_oauth_test")

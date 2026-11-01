@@ -59,7 +59,9 @@ export async function validateOAuthUrl(value: string | URL, resolver = lookup) {
   ) {
     throw new Error("OAuth destination is not a public network address");
   }
-  return { url, address: addresses[0]! };
+  const address = addresses[0];
+  if (!address) throw new Error("OAuth destination did not resolve");
+  return { url, address };
 }
 
 // Resolve once, validate every answer and pin the connection to that answer.

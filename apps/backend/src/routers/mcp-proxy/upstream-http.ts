@@ -4,6 +4,7 @@ import { Readable } from "node:stream";
 import { TRPCError } from "@trpc/server";
 import express from "express";
 
+import { transformDockerUrl } from "../../lib/metamcp/transport-url";
 import { requireOAuthServer } from "../../lib/oauth-upstream/access";
 import { createUpstreamFetch } from "../../lib/oauth-upstream/upstream-fetch";
 
@@ -68,12 +69,18 @@ upstreamHttpRouter.all(
         const value = req.get(name);
         if (value) headers.set(name, value);
       }
+      const manualAuthorization = req.get("authorization");
       if (server.bearerToken)
         headers.set("Authorization", `Bearer ${server.bearerToken}`);
-      else if (req.get("authorization"))
-        headers.set("Authorization", req.get("authorization")!);
+      else if (manualAuthorization)
+        headers.set("Authorization", manualAuthorization);
       if (session) headers.set("mcp-session-id", session.upstream);
-      const response = await createUpstreamFetch(server, user)(server.url, {
+      const transportUrl = transformDockerUrl(server.url);
+      const response = await createUpstreamFetch(
+        server,
+        user,
+        transportUrl,
+      )(transportUrl, {
         method: req.method,
         headers,
         signal: controller.signal,

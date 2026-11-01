@@ -30,7 +30,9 @@ describe("upstream token attachment", () => {
     );
     const authorizations: string[] = [];
     vi.mocked(safeOAuthFetch).mockImplementation(async (_url, init) => {
-      authorizations.push(new Headers(init?.headers).get("authorization")!);
+      authorizations.push(
+        new Headers(init?.headers).get("authorization") ?? "",
+      );
       return new Response("ok");
     });
     await Promise.all([
@@ -84,6 +86,22 @@ describe("upstream token attachment", () => {
       ...server,
       oauth_user_id: "alice",
     });
+  });
+  it("preserves the Docker transport URL for non-OAuth servers without moving OAuth credentials", async () => {
+    const local = { ...server, url: "http://localhost:8000/mcp" };
+    const transformed = "http://host.docker.internal:8000/mcp";
+    const plainFetch = vi.fn<typeof fetch>(async () => new Response("ok"));
+    vi.stubGlobal("fetch", plainFetch);
+    await createUpstreamFetch(local, undefined, transformed)(transformed);
+    expect(String(plainFetch.mock.calls[0]?.[0])).toBe(transformed);
+    vi.mocked(repo.findByMcpServerUuid).mockResolvedValue({
+      client_information: { server_url: local.url },
+      tokens: { access_token: "secret" },
+    } as never);
+    await expect(
+      createUpstreamFetch(local, "alice", transformed)(transformed),
+    ).rejects.toThrow("transformed origin");
+    expect(safeOAuthFetch).not.toHaveBeenCalled();
   });
   it("never sends credentials to a cross-origin SSE endpoint", async () => {
     await expect(

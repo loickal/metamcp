@@ -103,7 +103,9 @@ export class OAuthSessionsRepository {
         ...encode(input),
       })
       .returning();
-    return decode(row)!;
+    const session = decode(row);
+    if (!session) throw new Error("Failed to save OAuth session");
+    return session;
   }
 
   async update(input: OAuthSessionUpdateInput) {
@@ -150,7 +152,9 @@ export class OAuthSessionsRepository {
       })
       .returning();
     if (!row) throw new Error("Failed to save OAuth session");
-    return decode(row)!;
+    const session = decode(row);
+    if (!session) throw new Error("Failed to save OAuth session");
+    return session;
   }
 
   async deleteByMcpServerUuid(server: string, user: string) {

@@ -10,6 +10,7 @@ export type { BaseContext } from "./trpc";
 
 // Export router creators
 export { createAppRouter, createFrontendRouter } from "./router";
+export { createOAuthRouter } from "./routers/frontend/oauth";
 export { createMcpServersRouter } from "./routers/frontend";
 
 // Export all zod types for convenience

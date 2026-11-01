@@ -7,6 +7,7 @@ vi.mock("node:dns/promises", () => ({ lookup: vi.fn() }));
 vi.mock("node:https", () => ({ request: vi.fn() }));
 import { lookup } from "node:dns/promises";
 import { request } from "node:https";
+
 import {
   isPublicAddress,
   readOAuthJson,

@@ -14,13 +14,14 @@ import logger from "@/utils/logger";
 
 import { mcpServersRepository } from "../../db/repositories";
 import mcpProxy from "../../lib/mcp-proxy";
+import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
+import { transformDockerUrl } from "../../lib/metamcp/transport-url";
+import { resolveEnvVariables } from "../../lib/metamcp/utils";
 import { requireOAuthServer } from "../../lib/oauth-upstream/access";
 import { createUpstreamFetch } from "../../lib/oauth-upstream/upstream-fetch";
-import { upstreamHttpRouter } from "./upstream-http";
-import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
-import { resolveEnvVariables } from "../../lib/metamcp/utils";
 import { ProcessManagedStdioTransport } from "../../lib/stdio-transport/process-managed-transport";
 import { betterAuthMcpMiddleware } from "../../middleware/better-auth-mcp.middleware";
+import { upstreamHttpRouter } from "./upstream-http";
 
 const SSE_HEADERS_PASSTHROUGH = ["authorization"];
 const STREAMABLE_HTTP_HEADERS_PASSTHROUGH = [
@@ -315,9 +316,10 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
     };
     if (server.bearerToken)
       headers.Authorization = `Bearer ${server.bearerToken}`;
-    const upstreamFetch = createUpstreamFetch(server, userId);
+    const transportUrl = transformDockerUrl(server.url);
+    const upstreamFetch = createUpstreamFetch(server, userId, transportUrl);
     let challenge: string | null | undefined;
-    const transport = new SSEClientTransport(new URL(server.url), {
+    const transport = new SSEClientTransport(new URL(transportUrl), {
       fetch: upstreamFetch,
       eventSourceInit: {
         fetch: async (url, init) => {
