@@ -41,49 +41,24 @@ export default function mcpProxy({
 }) {
   let transportToClientClosed = false;
   let transportToServerClosed = false;
-  let cleanupCalled = false;
-
-  let reportedServerSession = false;
-
-  // Helper function to safely trigger cleanup once
-  const triggerCleanup = async () => {
-    if (cleanupCalled) {
-      logger.debug("Cleanup already called, skipping");
-      return;
-    }
-    if (!onCleanup) {
-      logger.debug("No cleanup callback provided, skipping");
-      return;
-    }
-    cleanupCalled = true;
-
-    try {
-      logger.debug(
-        "Triggering MCP proxy cleanup (server session/subprocess cleanup)",
-      );
-      await onCleanup();
-      logger.debug("MCP proxy cleanup completed successfully");
-    } catch (error) {
-      logger.error("Error during MCP proxy cleanup:", error);
-    }
-  };
-
-  // Helper function to close both transports safely
-  const closeAllTransports = async () => {
-    const promises = [];
-
-    if (!transportToClientClosed) {
-      transportToClientClosed = true;
-      promises.push(transportToClient.close().catch(onClientError));
-    }
-
-    if (!transportToServerClosed) {
-      transportToServerClosed = true;
-      promises.push(transportToServer.close().catch(onServerError));
-    }
-
-    await Promise.allSettled(promises);
-    await triggerCleanup();
+  let closing: Promise<void> | undefined;
+  // The session owner closes transports when supplied. Closing them here too
+  // reenters onclose -> route cleanup and sends duplicate process signals.
+  const closeAllTransports = (): Promise<void> => {
+    if (closing) return closing;
+    transportToClientClosed = true;
+    transportToServerClosed = true;
+    closing = Promise.resolve()
+      .then(async () => {
+        if (onCleanup) await onCleanup();
+        else
+          await Promise.allSettled([
+            transportToClient.close(),
+            transportToServer.close(),
+          ]);
+      })
+      .catch(() => logger.error("MCP proxy cleanup failed"));
+    return closing;
   };
 
   transportToClient.onmessage = (message) => {
@@ -124,16 +99,6 @@ export default function mcpProxy({
   };
 
   transportToServer.onmessage = (message) => {
-    if (!reportedServerSession) {
-      if (transportToServer.sessionId) {
-        // Can only report for StreamableHttp
-        logger.info(
-          "Proxy  <-> Server sessionId: " + transportToServer.sessionId,
-        );
-      }
-      reportedServerSession = true;
-    }
-
     // Check if client transport is still connected before sending
     if (transportToClientClosed) {
       logger.debug("Ignoring message to closed client transport");
@@ -153,28 +118,15 @@ export default function mcpProxy({
     });
   };
 
-  transportToClient.onclose = async () => {
-    logger.debug("Client transport closed");
-    if (!transportToClientClosed) {
-      transportToClientClosed = true;
-      if (!transportToServerClosed) {
-        logger.debug("Closing server transport due to client close");
-        await transportToServer.close().catch(onServerError);
-      }
-    }
-    await triggerCleanup();
+  const clientOnClose = transportToClient.onclose;
+  const serverOnClose = transportToServer.onclose;
+  transportToClient.onclose = () => {
+    clientOnClose?.();
+    void closeAllTransports();
   };
-
-  transportToServer.onclose = async () => {
-    logger.debug("Server transport closed");
-    if (!transportToServerClosed) {
-      transportToServerClosed = true;
-      if (!transportToClientClosed) {
-        logger.debug("Closing client transport due to server close");
-        await transportToClient.close().catch(onClientError);
-      }
-    }
-    await triggerCleanup();
+  transportToServer.onclose = () => {
+    serverOnClose?.();
+    void closeAllTransports();
   };
 
   transportToClient.onerror = async (error) => {

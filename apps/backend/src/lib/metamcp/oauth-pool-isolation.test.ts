@@ -56,26 +56,33 @@ describe("personal OAuth pool isolation", () => {
     expect(mcpServerPool.getPoolStatus().idle).toBe(0);
     expect(connectMetaMcpClient).toHaveBeenCalledTimes(2);
   });
-  it("never lends another user's connection when the server cap is reached", async () => {
-    for (let i = 0; i < 5; i++)
-      await mcpServerPool.getSession(`session-${i}`, params.uuid, {
-        ...params,
-        oauth_user_id: `user-${i}`,
-      });
-    expect(
-      await mcpServerPool.getSession("sixth", params.uuid, {
-        ...params,
-        oauth_user_id: "sixth",
-      }),
-    ).toBeUndefined();
-    expect(connectMetaMcpClient).toHaveBeenCalledTimes(5);
+  it("reclaims an unused slot without lending another user's credentials", async () => {
+    const prior: ConnectedClient[] = [];
+    for (let i = 0; i < 5; i++) {
+      const connected = await mcpServerPool.getSession(
+        `session-${i}`,
+        params.uuid,
+        { ...params, oauth_user_id: `user-${i}` },
+      );
+      if (connected) prior.push(connected);
+    }
+    const sixth = await mcpServerPool.getSession("sixth", params.uuid, {
+      ...params,
+      oauth_user_id: "sixth",
+    });
+    expect(sixth?.oauthUserId).toBe("sixth");
+    expect(prior).not.toContain(sixth);
+    expect(prior[0]?.cleanup).toHaveBeenCalledOnce();
+    expect(connectMetaMcpClient).toHaveBeenCalledTimes(6);
     const anonymous = await mcpServerPool.getSession(
       "anonymous",
       params.uuid,
       params,
     );
-    expect(anonymous).toBeUndefined();
-    expect(connectMetaMcpClient).toHaveBeenCalledTimes(5);
+    expect(anonymous).toBeDefined();
+    expect(anonymous?.oauthUserId).toBeUndefined();
+    expect(prior).not.toContain(anonymous);
+    expect(mcpServerPool.getPoolStatus().active).toBe(5);
   });
 });
 
@@ -230,4 +237,158 @@ it("a closing idle connection cannot be borrowed while configuration invalidatio
   release();
   await invalidate;
   expect(old.cleanup).toHaveBeenCalledOnce();
+});
+
+it("serves calls in more than five downstream sessions without DELETE by reclaiming unused upstream connections", async () => {
+  const clients: ConnectedClient[] = [];
+  for (let i = 0; i < 20; i++) {
+    await mcpServerPool.withSessionActivity(`chatgpt-${i}`, async () => {
+      const client = await mcpServerPool.getSession(
+        `chatgpt-${i}`,
+        params.uuid,
+        { ...params, oauth_user_id: "alice" },
+      );
+      expect(client, `connection for logical session ${i + 1}`).toBeDefined();
+      if (client) clients.push(client);
+    });
+    expect(mcpServerPool.getPoolStatus().active).toBeLessThanOrEqual(5);
+  }
+  expect(new Set(clients).size).toBe(20);
+  expect(clients[0]?.cleanup).toHaveBeenCalledOnce();
+});
+it("handles an upstream process crash during initialization without a temporal-dead-zone exception", async () => {
+  vi.mocked(connectMetaMcpClient).mockImplementationOnce(
+    async (_params, crash) => {
+      crash?.(1, null);
+      return undefined;
+    },
+  );
+  await expect(
+    mcpServerPool.getSession("early-crash", params.uuid, {
+      ...params,
+      oauth_user_id: "alice",
+    }),
+  ).resolves.toBeUndefined();
+});
+
+it("does not reclaim connections while their owning sessions have in-flight work", async () => {
+  const releases: Array<() => void> = [];
+  const running = Array.from({ length: 5 }, (_, i) =>
+    mcpServerPool.withSessionActivity(`busy-${i}`, async () => {
+      await mcpServerPool.getSession(`busy-${i}`, params.uuid, {
+        ...params,
+        oauth_user_id: "alice",
+      });
+      await new Promise<void>((resolve) => {
+        releases.push(resolve);
+      });
+    }),
+  );
+  try {
+    await vi.waitFor(() => expect(releases).toHaveLength(5));
+    expect(
+      await mcpServerPool.getSession("busy-sixth", params.uuid, {
+        ...params,
+        oauth_user_id: "alice",
+      }),
+    ).toBeUndefined();
+    expect(connectMetaMcpClient).toHaveBeenCalledTimes(5);
+  } finally {
+    releases.forEach((release) => release());
+    await Promise.all(running);
+  }
+  expect(
+    await mcpServerPool.getSession("after-drain", params.uuid, {
+      ...params,
+      oauth_user_id: "alice",
+    }),
+  ).toBeDefined();
+});
+it("keeps a reclaimed slot reserved until the old process has actually closed", async () => {
+  const clients: ConnectedClient[] = [];
+  for (let i = 0; i < 5; i++) {
+    const client = await mcpServerPool.getSession(`old-${i}`, params.uuid, {
+      ...params,
+      oauth_user_id: "alice",
+    });
+    if (client) clients.push(client);
+  }
+  const releases: Array<() => void> = [];
+  for (const client of clients)
+    vi.mocked(client.cleanup).mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releases.push(resolve);
+        }),
+    );
+  const replacements = Array.from({ length: 5 }, (_, i) =>
+    mcpServerPool.getSession(`new-${i}`, params.uuid, {
+      ...params,
+      oauth_user_id: "alice",
+    }),
+  );
+  try {
+    await vi.waitFor(() => expect(releases).toHaveLength(5));
+    expect(connectMetaMcpClient).toHaveBeenCalledTimes(5);
+    expect(
+      await mcpServerPool.getSession("too-many", params.uuid, {
+        ...params,
+        oauth_user_id: "alice",
+      }),
+    ).toBeUndefined();
+  } finally {
+    releases.forEach((release) => release());
+    await Promise.all(replacements);
+  }
+  expect(connectMetaMcpClient).toHaveBeenCalledTimes(10);
+  expect(mcpServerPool.getPoolStatus().active).toBe(5);
+});
+
+it("reserves the retiring server's slot when global pressure replaces a different upstream", async () => {
+  const personal = { ...params, oauth_user_id: "alice" };
+  const retiring = await mcpServerPool.getSession(
+    "oldest",
+    params.uuid,
+    personal,
+  );
+  if (!retiring) throw new Error("Fixture connection was not created");
+  let releaseRetiring: (() => void) | undefined;
+  vi.mocked(retiring.cleanup).mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        releaseRetiring = resolve;
+      }),
+  );
+  const releases: Array<() => void> = [];
+  const busy = Array.from({ length: 4 }, (_, i) =>
+    mcpServerPool.withSessionActivity(`busy-${i}`, async () => {
+      await mcpServerPool.getSession(`busy-${i}`, params.uuid, personal);
+      await new Promise<void>((resolve) => {
+        releases.push(resolve);
+      });
+    }),
+  );
+  let replacement: Promise<ConnectedClient | undefined> | undefined;
+  try {
+    await vi.waitFor(() => expect(releases).toHaveLength(4));
+    for (let i = 0; i < 95; i++)
+      await mcpServerPool.getSession(`filler-${i}`, `server-${i}`, {
+        ...personal,
+        uuid: `server-${i}`,
+      });
+    replacement = mcpServerPool.getSession("new-server", "new-server", {
+      ...personal,
+      uuid: "new-server",
+    });
+    await vi.waitFor(() => expect(releaseRetiring).toBeDefined());
+    expect(
+      await mcpServerPool.getSession("sixth", params.uuid, personal),
+    ).toBeUndefined();
+    expect(connectMetaMcpClient).toHaveBeenCalledTimes(100);
+  } finally {
+    releaseRetiring?.();
+    releases.forEach((release) => release());
+    await Promise.all([...busy, replacement]);
+  }
+  expect(mcpServerPool.getPoolStatus().active).toBe(100);
 });

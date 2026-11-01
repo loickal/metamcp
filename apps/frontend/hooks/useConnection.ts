@@ -433,6 +433,10 @@ export function useConnection({
         switch (transportType) {
           case McpServerTypeEnum.enum.STDIO:
             mcpProxyServerUrl = new URL(`/mcp-proxy/server/stdio`, getAppUrl());
+            mcpProxyServerUrl.searchParams.append(
+              "mcpServerUuid",
+              mcpServerUuid,
+            );
             mcpProxyServerUrl.searchParams.append("command", command);
             mcpProxyServerUrl.searchParams.append("args", args);
             mcpProxyServerUrl.searchParams.append("env", JSON.stringify(env));

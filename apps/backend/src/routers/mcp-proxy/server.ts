@@ -20,6 +20,7 @@ import { resolveEnvVariables } from "../../lib/metamcp/utils";
 import { requireOAuthServer } from "../../lib/oauth-upstream/access";
 import { createUpstreamFetch } from "../../lib/oauth-upstream/upstream-fetch";
 import { ProcessManagedStdioTransport } from "../../lib/stdio-transport/process-managed-transport";
+import { resolveStdioServerUuid } from "../../lib/stdio-transport/stdio-server-identity";
 import { betterAuthMcpMiddleware } from "../../middleware/better-auth-mcp.middleware";
 import { upstreamHttpRouter } from "./upstream-http";
 
@@ -74,55 +75,20 @@ const setStdioCooldown = (
   stdioCommandCooldowns.set(key, Date.now() + STDIO_COOLDOWN_DURATION);
 };
 
-// Function to extract server UUID from STDIO command
-const extractServerUuidFromStdioCommand = async (
+const extractServerUuidFromStdioCommand = (
   command: string,
   args: string[],
-): Promise<string | null> => {
-  try {
-    // For filesys server, the command is typically: npx @modelcontextprotocol/server-filesystem /workspaceFolder
-    // We need to find the server in the database that matches this command pattern
-
-    // First, try to find by command and args pattern
-    const fullCommand = `${command} ${args.join(" ")}`;
-    logger.info(`Looking for server with command: ${fullCommand}`);
-
-    // Look for servers that match this command pattern
-    const servers = await mcpServersRepository.findAll();
-    logger.info(`Found ${servers.length} servers in database`);
-
-    for (const server of servers) {
-      if (server.type === "STDIO" && server.command) {
-        const serverCommand = `${server.command} ${(server.args || []).join(" ")}`;
-        logger.info(
-          `Checking server ${server.name} (${server.uuid}): ${serverCommand}`,
-        );
-        if (serverCommand === fullCommand) {
-          logger.info(
-            `Found exact match for server ${server.name} (${server.uuid})`,
-          );
-          return server.uuid;
-        }
-      }
-    }
-
-    // If no exact match, try to find by command only (for cases where args might vary)
-    for (const server of servers) {
-      if (server.type === "STDIO" && server.command === command) {
-        logger.info(
-          `Found command-only match for server ${server.name} (${server.uuid})`,
-        );
-        return server.uuid;
-      }
-    }
-
-    logger.info(`No server found for command: ${fullCommand}`);
-    return null;
-  } catch (error) {
-    logger.error("Error extracting server UUID from STDIO command:", error);
-    return null;
-  }
-};
+  req: express.Request,
+) =>
+  resolveStdioServerUuid({
+    command,
+    args,
+    userId: (req as express.Request & { user: { id: string } }).user.id,
+    serverUuid:
+      typeof req.query.mcpServerUuid === "string"
+        ? req.query.mcpServerUuid
+        : undefined,
+  });
 
 // Function to check if server is in error state
 const checkServerErrorStatus = async (serverUuid: string): Promise<boolean> => {
@@ -206,39 +172,26 @@ serverRouter.use((req, res, next) => {
 const serverTransports: Map<string, Transport> = new Map<string, Transport>(); // Server Transports by web app sessionId
 
 // Session cleanup function
-const cleanupSession = async (sessionId: string) => {
-  logger.info(`Cleaning up proxy session ${sessionId}`);
-  sessionOwners.delete(sessionId);
-
-  // Clean up web app transport
+const closingSessions = new Map<string, Promise<void>>();
+const cleanupSession = (sessionId: string): Promise<void> => {
+  const existing = closingSessions.get(sessionId);
+  if (existing) return existing;
   const webAppTransport = webAppTransports.get(sessionId);
-  if (webAppTransport) {
-    try {
-      await webAppTransport.close();
-    } catch (error) {
-      logger.error(
-        `Error closing web app transport for session ${sessionId}:`,
-        error,
-      );
-    }
-    webAppTransports.delete(sessionId);
-  }
-
-  // Clean up server transport
   const serverTransport = serverTransports.get(sessionId);
-  if (serverTransport) {
-    try {
-      await serverTransport.close();
-    } catch (error) {
-      logger.error(
-        `Error closing server transport for session ${sessionId}:`,
-        error,
-      );
-    }
-    serverTransports.delete(sessionId);
-  }
-
-  logger.info(`Session ${sessionId} cleanup completed`);
+  // Detach before close callbacks or HTTP finish/close can reenter.
+  webAppTransports.delete(sessionId);
+  serverTransports.delete(sessionId);
+  sessionOwners.delete(sessionId);
+  const closing = Promise.resolve()
+    .then(async () => {
+      await Promise.allSettled([
+        webAppTransport?.close(),
+        serverTransport?.close(),
+      ]);
+    })
+    .finally(() => closingSessions.delete(sessionId));
+  closingSessions.set(sessionId, closing);
+  return closing;
 };
 
 const createTransport = async (req: express.Request): Promise<Transport> => {
@@ -272,7 +225,7 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
     }
 
     // Check if the server is in error state
-    const serverUuid = await extractServerUuidFromStdioCommand(cmd, args);
+    const serverUuid = await extractServerUuidFromStdioCommand(cmd, args, req);
     if (serverUuid) {
       const isInError = await checkServerErrorStatus(serverUuid);
       if (isInError) {
@@ -425,6 +378,7 @@ serverRouter.get("/stdio", async (req, res) => {
       const serverUuid = await extractServerUuidFromStdioCommand(
         command,
         origArgs,
+        req,
       );
 
       if (serverUuid) {
@@ -453,6 +407,7 @@ serverRouter.get("/stdio", async (req, res) => {
 
     // Handle transport close events
     stdinTransport.onclose = () => {
+      if (stdinTransport.isClosing) return;
       const runTime = Date.now() - commandStartTime;
       if (runTime < QUICK_FAILURE_THRESHOLD) {
         // Process failed quickly, likely a startup error
@@ -493,8 +448,7 @@ serverRouter.get("/stdio", async (req, res) => {
                 logger.error("Error sending stderr notification:", error);
               }
             });
-          webAppTransport.close();
-          cleanupSession(webAppTransport.sessionId);
+          void cleanupSession(webAppTransport.sessionId);
           logger.error("Command not found, transports removed");
         } else {
           // Check for common startup errors that should trigger cooldown

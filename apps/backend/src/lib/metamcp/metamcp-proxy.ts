@@ -124,8 +124,8 @@ export const createServer = async (
     requestContext?.auth?.sessionUserId ??
     requestContext?.auth?.oauthUserId ??
     requestContext?.auth?.apiKeyUserId;
-  const promptToClient: Record<string, ConnectedClient> = {};
-  const resourceToClient: Record<string, ConnectedClient> = {};
+  const promptToServer: Record<string, string> = {};
+  const resourceToServer: Record<string, string> = {};
 
   // Helper function to detect if a server is the same instance
   const isSameServerInstance = (
@@ -331,7 +331,17 @@ export const createServer = async (
       effective,
       namespaceUuid,
     );
-    if (!active) throw unavailable();
+    if (!active) {
+      mcpEvent(
+        "upstream_preflight_failed",
+        { namespace: namespaceUuid, upstream: uuid, stage: "connection" },
+        sessionId,
+      );
+      throw new McpError(
+        ErrorCode.InternalError,
+        "Upstream connection unavailable before tool execution. No tool call was sent.",
+      );
+    }
     // Recover with a safe metadata request BEFORE issuing tools/call. A lost
     // response to a tool invocation can mean it executed: never replay it.
     let tools: Tool[];
@@ -351,7 +361,15 @@ export const createServer = async (
         },
       });
     } catch {
-      throw unavailable();
+      mcpEvent(
+        "upstream_preflight_failed",
+        { namespace: namespaceUuid, upstream: uuid, stage: "metadata" },
+        sessionId,
+      );
+      throw new McpError(
+        ErrorCode.InternalError,
+        "Upstream metadata unavailable before tool execution. No tool call was sent.",
+      );
     }
     if (!tools.some((tool) => tool.name === parsed.originalToolName)) {
       mcpEvent(
@@ -450,45 +468,62 @@ export const createServer = async (
     return await callToolWithMiddleware(request, handlerContext);
   });
 
-  // Get Prompt Handler
+  // Advertised metadata identifies its server, not a permanent client pointer:
+  // a pool slot may be reclaimed between RPCs while this MCP session stays alive.
+  async function readMetadata<T>(
+    uuid: string,
+    operation: string,
+    attempt: (client: ConnectedClient) => Promise<T>,
+  ) {
+    const servers = await getMcpServers(
+      namespaceUuid,
+      includeInactiveServers,
+      oauthUserId,
+    );
+    const params = servers[uuid];
+    if (!params) throw unavailable();
+    const forwarded = clientRequestHeaders
+      ? extractForwardedHeaders(clientRequestHeaders, servers)[uuid]
+      : undefined;
+    const effective = forwarded
+      ? { ...params, headers: mergeHeaders(params.headers, forwarded) }
+      : params;
+    const session = await mcpServerPool.getSession(
+      sessionId,
+      uuid,
+      effective,
+      namespaceUuid,
+    );
+    if (!session) throw unavailable();
+    return requestWithSessionRecovery({
+      pool: mcpServerPool,
+      sessionId,
+      serverUuid: uuid,
+      params: effective,
+      namespaceUuid,
+      operation,
+      serverName: params.name,
+      session,
+      attempt,
+    });
+  }
   server.setRequestHandler(GetPromptRequestSchema, async (request) => {
-    const { name } = request.params;
-    const clientForPrompt = promptToClient[name];
-
-    if (!clientForPrompt) {
-      throw new Error(`Unknown prompt: ${name}`);
-    }
-
-    try {
-      // Parse the prompt name using shared utility
-      const parsed = parseToolName(name);
-      if (!parsed) {
-        throw new Error(`Invalid prompt name format: ${name}`);
-      }
-
-      const promptName = parsed.originalToolName;
-      const response = await clientForPrompt.client.request(
+    const uuid = promptToServer[request.params.name];
+    const parsed = parseToolName(request.params.name);
+    if (!uuid || !parsed) throw new Error("Unknown prompt");
+    return readMetadata(uuid, "prompts/get", (active) =>
+      active.client.request(
         {
           method: "prompts/get",
           params: {
-            name: promptName,
+            name: parsed.originalToolName,
             arguments: request.params.arguments || {},
             _meta: request.params._meta,
           },
         },
         GetPromptResultSchema,
-      );
-
-      return response;
-    } catch (error) {
-      logger.error(
-        `Error getting prompt through ${
-          clientForPrompt.client.getServerVersion()?.name
-        }:`,
-        error,
-      );
-      throw error;
-    }
+      ),
+    );
   });
 
   // List Prompts Handler
@@ -583,7 +618,6 @@ export const createServer = async (
         const serverName =
           params.name || session.client.getServerVersion()?.name || "";
         try {
-          let activeSession = session;
           const result = await requestWithSessionRecovery({
             pool: mcpServerPool,
             sessionId,
@@ -604,15 +638,12 @@ export const createServer = async (
                 },
                 ListPromptsResultSchema,
               ),
-            onFreshSession: (fresh) => {
-              activeSession = fresh;
-            },
           });
 
           if (result.prompts) {
             const promptsWithSource = result.prompts.map((prompt) => {
               const promptName = `${sanitizeName(serverName)}__${prompt.name}`;
-              promptToClient[promptName] = activeSession;
+              promptToServer[promptName] = uuid;
               return {
                 ...prompt,
                 name: promptName,
@@ -732,7 +763,6 @@ export const createServer = async (
         const serverName =
           params.name || session.client.getServerVersion()?.name || "";
         try {
-          let activeSession = session;
           const result = await requestWithSessionRecovery({
             pool: mcpServerPool,
             sessionId,
@@ -753,14 +783,11 @@ export const createServer = async (
                 },
                 ListResourcesResultSchema,
               ),
-            onFreshSession: (fresh) => {
-              activeSession = fresh;
-            },
           });
 
           if (result.resources) {
             const resourcesWithSource = result.resources.map((resource) => {
-              resourceToClient[resource.uri] = activeSession;
+              resourceToServer[resource.uri] = uuid;
               return {
                 ...resource,
                 name: resource.name || "",
@@ -787,35 +814,15 @@ export const createServer = async (
     };
   });
 
-  // Read Resource Handler
   server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-    const { uri } = request.params;
-    const clientForResource = resourceToClient[uri];
-
-    if (!clientForResource) {
-      throw new Error(`Unknown resource: ${uri}`);
-    }
-
-    try {
-      return await clientForResource.client.request(
-        {
-          method: "resources/read",
-          params: {
-            uri,
-            _meta: request.params._meta,
-          },
-        },
+    const uuid = resourceToServer[request.params.uri];
+    if (!uuid) throw new Error("Unknown resource");
+    return readMetadata(uuid, "resources/read", (active) =>
+      active.client.request(
+        { method: "resources/read", params: request.params },
         ReadResourceResultSchema,
-      );
-    } catch (error) {
-      logger.error(
-        `Error reading resource through ${
-          clientForResource.client.getServerVersion()?.name
-        }:`,
-        error,
-      );
-      throw error;
-    }
+      ),
+    );
   });
 
   // List Resource Templates Handler

@@ -124,7 +124,9 @@ export class McpServerPool {
     }
 
     count += [...this.pending.values()].filter(
-      (entry) => entry.serverUuid === serverUuid,
+      (entry) =>
+        entry.serverUuid === serverUuid ||
+        entry.retiringServerUuid === serverUuid,
     ).length;
     return count;
   }
@@ -168,6 +170,7 @@ export class McpServerPool {
     {
       sessionId: string;
       serverUuid: string;
+      retiringServerUuid?: string;
       userId?: string;
       fingerprint: string;
       promise: Promise<ConnectedClient | undefined>;
@@ -249,15 +252,45 @@ export class McpServerPool {
       this.sessionToServers[sessionId].add(serverUuid);
       return idle;
     }
-    // Reserve before the asynchronous connect. Never borrow an active client
-    // from another downstream session, even when all slots are occupied.
-    if (
-      !this.canCreateConnectionForServer(serverUuid) ||
-      !this.canCreateConnection()
-    )
+    // Logical MCP sessions can outlive their last RPC indefinitely. Under
+    // pressure, detach an UNUSED connection and close it before opening its
+    // replacement. Never share it, and never evict a session with in-flight work.
+    const serverFull =
+      this.countConnectionsForServer(serverUuid) >=
+      this.maxConnectionsPerServer;
+    const totalFull =
+      this.getTotalConnectionCount() >= this.maxTotalConnections;
+    const reclaimed =
+      serverFull || totalFull
+        ? this.detachUnusedConnection(serverFull ? serverUuid : undefined)
+        : undefined;
+    if ((serverFull || totalFull) && !reclaimed) {
+      mcpEvent(
+        "upstream_capacity_exhausted",
+        {
+          upstream: serverUuid,
+          namespace: namespaceUuid,
+          perServer: this.countConnectionsForServer(serverUuid),
+          total: this.getTotalConnectionCount(),
+        },
+        sessionId,
+      );
       return undefined;
+    }
+    // Set pending synchronously: its reservation replaces the detached victim's
+    // slot, including while that victim is still closing. New connections cannot
+    // race past the cap or reuse the closing process.
     const promise = Promise.resolve()
       .then(async () => {
+        if (reclaimed) {
+          await reclaimed.client.cleanup();
+          mcpEvent(
+            "upstream_idle_reclaimed",
+            { upstream: reclaimed.serverUuid },
+            reclaimed.sessionId,
+          );
+        }
+        if (this.stopping || this.closing.has(sessionId)) return undefined;
         const client = await this.createNewConnection(
           params,
           namespaceUuid,
@@ -281,11 +314,43 @@ export class McpServerPool {
     this.pending.set(key, {
       sessionId,
       serverUuid,
+      // A global-cap replacement can retire a different upstream. Keep that
+      // upstream's per-server slot reserved too until the replacement settles.
+      retiringServerUuid: reclaimed?.serverUuid,
       userId: params.oauth_user_id,
       fingerprint: this.fingerprint(params),
       promise,
     });
     return promise;
+  }
+
+  private detachUnusedConnection(
+    onlyServer?: string,
+  ):
+    | { client: ConnectedClient; serverUuid: string; sessionId?: string }
+    | undefined {
+    for (const [serverUuid, client] of Object.entries(this.idleSessions)) {
+      if (!onlyServer || onlyServer === serverUuid) {
+        delete this.idleSessions[serverUuid];
+        return { client, serverUuid };
+      }
+    }
+    const owners = Object.keys(this.activeSessions).sort(
+      (a, b) =>
+        (this.sessionTimestamps[a] ?? 0) - (this.sessionTimestamps[b] ?? 0),
+    );
+    for (const owner of owners) {
+      if (this.inFlight.has(owner) || this.closing.has(owner)) continue;
+      for (const [serverUuid, client] of Object.entries(
+        this.activeSessions[owner],
+      )) {
+        if (onlyServer && serverUuid !== onlyServer) continue;
+        delete this.activeSessions[owner][serverUuid];
+        this.sessionToServers[owner]?.delete(serverUuid);
+        return { client, serverUuid, sessionId: owner };
+      }
+    }
+    return undefined;
   }
 
   /**
@@ -330,7 +395,7 @@ export class McpServerPool {
             namespaceUuid,
             exitCode,
             signal,
-            connectedClient,
+            owner.client,
           ).catch((error) => {
             logger.error(
               `Error handling server crash for ${params.uuid} in ${namespaceUuid}:`,
@@ -343,7 +408,7 @@ export class McpServerPool {
             params.uuid,
             exitCode,
             signal,
-            connectedClient,
+            owner.client,
           ).catch((error) => {
             logger.error(
               `Error handling server crash for ${params.uuid} (no namespace):`,

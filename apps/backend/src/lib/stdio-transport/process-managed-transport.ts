@@ -125,6 +125,16 @@ export class ProcessManagedStdioTransport implements Transport {
   private _serverParams: StdioServerParameters;
   private _stderrStream: PassThrough | null = null;
   private _isCleanup: boolean = false;
+  private _closing?: Promise<void>;
+  private _closeNotified = false;
+  get isClosing() {
+    return this._isCleanup;
+  }
+  private notifyClosed() {
+    if (this._closeNotified) return;
+    this._closeNotified = true;
+    this.onclose?.();
+  }
 
   onclose?: () => void;
   onerror?: (error: Error) => void;
@@ -142,7 +152,7 @@ export class ProcessManagedStdioTransport implements Transport {
    * Starts the server process and prepares to communicate with it.
    */
   async start(): Promise<void> {
-    if (this._process) {
+    if (this._process || this._isCleanup) {
       throw new Error(
         "StdioClientTransport already started! If using Client class, note that connect() calls start() automatically.",
       );
@@ -172,8 +182,9 @@ export class ProcessManagedStdioTransport implements Transport {
 
       this._process.on("error", (error) => {
         if (error.name === "AbortError") {
-          // Expected when close() is called.
-          this.onclose?.();
+          // Expected when close() is called. Settle start if shutdown raced
+          // with spawn, but leave close notification to actual process exit.
+          reject(error);
           return;
         }
 
@@ -199,7 +210,7 @@ export class ProcessManagedStdioTransport implements Transport {
         }
 
         this._process = undefined;
-        this.onclose?.();
+        this.notifyClosed();
       });
 
       this._process.stdin?.on("error", (error) => {
@@ -260,9 +271,14 @@ export class ProcessManagedStdioTransport implements Transport {
     }
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (this._closing) return this._closing;
     this._isCleanup = true;
+    this._closing = Promise.resolve().then(() => this.closeProcess());
+    return this._closing;
+  }
 
+  private async closeProcess(): Promise<void> {
     const proc = this._process;
     const pid = proc?.pid ?? null;
 
@@ -306,6 +322,7 @@ export class ProcessManagedStdioTransport implements Transport {
 
     this._process = undefined;
     this._readBuffer.clear();
+    this.notifyClosed();
   }
 
   send(message: JSONRPCMessage): Promise<void> {

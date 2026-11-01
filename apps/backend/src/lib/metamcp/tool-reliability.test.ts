@@ -84,12 +84,21 @@ beforeEach(async () => {
   vi.mocked(connectMetaMcpClient).mockImplementation(async (params) => {
     if (unavailable.has(params.uuid)) return undefined;
     const connection = {
-      cleanup: vi.fn(async () => {}),
+      cleanup: vi.fn(async () => {
+        dead.add(connection);
+      }),
       client: {
         getServerVersion: () => ({ name: params.name }),
-        getServerCapabilities: () => ({ tools: {} }),
+        getServerCapabilities: () => ({
+          tools: {},
+          prompts: {},
+          resources: {},
+        }),
         request: vi.fn(
-          async (request: { method: string; params?: { name?: string } }) => {
+          async (request: {
+            method: string;
+            params?: { name?: string; uri?: string };
+          }) => {
             if (dead.has(connection) || unavailable.has(params.uuid))
               throw new Error(
                 "Error POSTing to endpoint (HTTP 404): Session not found",
@@ -101,6 +110,29 @@ beforeEach(async () => {
                     name: toolName(params.uuid),
                     inputSchema: { type: "object" },
                   },
+                ],
+              };
+            if (request.method === "prompts/list")
+              return { prompts: [{ name: "summary" }] };
+            if (request.method === "resources/list")
+              return {
+                resources: [
+                  { uri: `fixture://${params.uuid}`, name: "status" },
+                ],
+              };
+            if (request.method === "prompts/get")
+              return {
+                messages: [
+                  {
+                    role: "user",
+                    content: { type: "text", text: "fixture prompt" },
+                  },
+                ],
+              };
+            if (request.method === "resources/read")
+              return {
+                contents: [
+                  { uri: request.params?.uri, text: "fixture resource" },
                 ],
               };
             calls.push(request.params?.name ?? "");
@@ -184,4 +216,66 @@ it("concurrent discovery recovery creates one replacement per failed upstream", 
   );
   expect(results.every((result) => result.tools.length === 2)).toBe(true);
   expect(connections).toHaveLength(4);
+});
+it("advertised UptimeKuma tools execute across twenty live downstream sessions and an older session can reconnect", async () => {
+  const opened: Array<{ sdk: Client; cleanup: () => Promise<void> }> = [];
+  try {
+    await client.listTools();
+    for (let i = 0; i < 20; i++) {
+      const instance = await createServer(
+        "namespace",
+        `chatgpt-call-${i}`,
+        false,
+        undefined,
+        {
+          endpointName: "loic",
+          auth: { method: "oauth", oauthUserId: "alice" },
+        },
+      );
+      const [a, b] = InMemoryTransport.createLinkedPair();
+      const sdk = new Client({ name: "chatgpt-fixture", version: "1" });
+      await instance.server.connect(b);
+      await sdk.connect(a);
+      opened.push({ sdk, cleanup: instance.cleanup });
+      expect(
+        (await sdk.callTool({ name: "UptimeKuma__getMonitorSummary" })).content,
+      ).toEqual([{ type: "text", text: "fixture result" }]);
+      expect(mcpServerPool.getPoolStatus().active).toBeLessThanOrEqual(6); // five Kuma slots plus the discovery's Coolify connection
+    }
+    expect(
+      (await client.callTool({ name: "UptimeKuma__getMonitorSummary" }))
+        .content,
+    ).toEqual([{ type: "text", text: "fixture result" }]);
+    expect(calls).toHaveLength(21);
+  } finally {
+    for (const connection of opened) {
+      await connection.sdk.close();
+      await connection.cleanup();
+    }
+  }
+});
+
+it("advertised prompts and resources reacquire clients after pool pressure", async () => {
+  await client.listPrompts();
+  await client.listResources();
+  const old = mcpServerPool.getSessionConnections("downstream")?.coolify;
+  for (let i = 0; i < 6; i++)
+    await mcpServerPool.withSessionActivity(
+      `metadata-pressure-${i}`,
+      async () => {
+        await mcpServerPool.getSession(
+          `metadata-pressure-${i}`,
+          "coolify",
+          coolify,
+          "namespace",
+        );
+      },
+    );
+  expect(old?.cleanup).toHaveBeenCalledOnce();
+  expect(
+    (await client.getPrompt({ name: "Coolify__summary" })).messages[0]?.content,
+  ).toEqual({ type: "text", text: "fixture prompt" });
+  expect(
+    (await client.readResource({ uri: "fixture://coolify" })).contents[0],
+  ).toEqual({ uri: "fixture://coolify", text: "fixture resource" });
 });

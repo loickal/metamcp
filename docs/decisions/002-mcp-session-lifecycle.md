@@ -81,9 +81,11 @@ Existing SESSION_LIFETIME configuration is interpreted as an **idle** timeout in
 milliseconds; null still means infinite, subject to capacity limits. Operators
 wanting abandoned sessions to expire must configure a finite timeout. Transport
 registries and the SDK server pool each cap reservations at 1,000. Existing
-upstream limits (MAX_TOTAL_CONNECTIONS, and five connections per upstream) now
-reject excess demand instead of sharing another session's active client.
-Capacity failures are explicit; increasing replicas alone does not fix routing.
+upstream limits (MAX_TOTAL_CONNECTIONS, and five connections per upstream) bound
+live connections. Under pressure, close an unused connection before opening a
+replacement for the requesting session. Never reclaim an in-flight RPC or share
+its client/credentials. Reject demand explicitly if all slots are busy.
+Increasing replicas alone does not fix routing.
 
 Logs include boot/request IDs, a boot-salted session fingerprint, lifecycle
 reasons/age/activity, recovery outcomes and discovery counts. X-Request-Id and
@@ -99,6 +101,33 @@ Rollback to the previous image/commit requires no database rollback and preserve
 the OAuth security changes already in bf818bd3. Any restart/rollback requires
 clients to establish new in-memory sessions. No production resources or data
 were modified while implementing this change.
+
+## Follow-up: upstream capacity and individual STDIO Inspector
+
+The deployed configuration used infinite session lifetime. A deterministic pool
+regression reproduced failure on the sixth logical session: five idle sessions
+retained every upstream slot. The replacement policy above keeps logical MCP
+sessions alive while reclaiming unused connections, with synchronous capacity
+reservations during shutdown/replacement. Tools, prompts and resources acquire
+the current connection on each operation. A real-SDK fixture now executes calls
+across 20 retained downstream sessions and then successfully reuses the first.
+This proves the local failure/fix; live UptimeKuma verification is still required.
+
+Independent regressions reproduced duplicate Inspector transport cleanup and
+three termination signals for one STDIO process. The route owns physical
+cleanup, detaches registry entries before callbacks, and shares its cleanup
+promise. The process transport also shares shutdown and emits close once. An
+intentional disconnect does not mark a process as a quick startup failure.
+Saved Inspector servers are identified by UUID, authorized user, resolved
+executable and exact arguments; legacy ambiguous command matches are ignored.
+No change from `npx` to an absolute path is necessary. That Inspector lookup was
+separate from the namespace tool-call capacity failure.
+
+The follow-up needs no environment, database, CORS or TLS changes. Preflight
+failures now state that no tool call was sent; uncertain tool execution is still
+never replayed. New aggregate counters distinguish exhausted capacity, reclaimed
+idle connections and connection/metadata preflight failures. Rollback to the
+previous image preserves OAuth isolation but reintroduces these reliability bugs.
 
 ## Regression checks
 
